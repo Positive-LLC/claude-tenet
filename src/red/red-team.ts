@@ -1,17 +1,13 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Mission, RedTeamResult } from "../types.ts";
+import type { Mission, PluginConfig, RedTeamResult } from "../types.ts";
 import { getSessionFilePath } from "../utils/session-path.ts";
-import { printWarning } from "../utils/logger.ts";
+import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { PROMPTS } from "../prompts.ts";
+import { getClaudePath } from "../utils/claude-path.ts";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-async function loadPrompt(path: string): Promise<string> {
-  const scriptDir = new URL(".", import.meta.url).pathname;
-  const projectRoot = resolve(scriptDir, "..", "..");
-  return await Deno.readTextFile(resolve(projectRoot, path));
-}
 
 function formatMissionContext(mission: Mission): string {
   return [
@@ -67,11 +63,16 @@ async function callSDK(
   prompt: string,
   options: Record<string, unknown>,
   abortController: AbortController,
+  label = "sdk-call",
 ): Promise<SDKCallResult> {
   let sessionId = "";
   let costUsd = 0;
   let errorSubtype = "";
   const messages: SDKMessage[] = [];
+  const elapsed = startTimer();
+
+  const resumeId = options.resume ? ` (resume=${String(options.resume).slice(0, 8)}...)` : "";
+  debug(`${label}: starting${resumeId} — prompt ${prompt.length} chars`);
 
   const q = query({
     prompt,
@@ -79,31 +80,48 @@ async function callSDK(
   });
 
   try {
+    let msgCount = 0;
     for await (const msg of q) {
-      if (abortController.signal.aborted) break;
+      msgCount++;
+      if (abortController.signal.aborted) {
+        debug(`${label}: aborted after ${msgCount} messages [${elapsed()}]`);
+        break;
+      }
 
       if (msg.type === "system" && "subtype" in msg && msg.subtype === "init") {
         sessionId = msg.session_id;
-      }
-
-      if (msg.type === "result") {
+        debug(`${label}: init — session=${sessionId.slice(0, 8)}... [${elapsed()}]`);
+      } else if (msg.type === "assistant") {
+        const preview = extractTextFromMessages([msg]).slice(0, 80).replace(/\n/g, " ");
+        debug(`${label}: assistant msg #${msgCount}${preview ? ` — "${preview}..."` : ""} [${elapsed()}]`);
+      } else if (msg.type === "result") {
         costUsd = msg.total_cost_usd;
         if (msg.subtype !== "success") {
           errorSubtype = msg.subtype;
+          debug(`${label}: result — ${msg.subtype} $${costUsd.toFixed(3)} [${elapsed()}]`);
+        } else {
+          debug(`${label}: result — success $${costUsd.toFixed(3)} [${elapsed()}]`);
         }
         break;
+      } else {
+        // Log other message types (tool_use, tool_result, etc.)
+        const subtype = "subtype" in msg ? `:${msg.subtype}` : "";
+        debug(`${label}: ${msg.type}${subtype} msg #${msgCount} [${elapsed()}]`);
       }
 
       messages.push(msg);
     }
+    debug(`${label}: stream ended — ${msgCount} messages total [${elapsed()}]`);
   } catch (err) {
     if (!abortController.signal.aborted) {
       printWarning(`SDK call error: ${err}`);
+      debug(`${label}: EXCEPTION — ${err} [${elapsed()}]`);
       errorSubtype = "exception";
     }
   }
 
   const text = extractTextFromMessages(messages);
+  debug(`${label}: done — text ${text.length} chars, session=${sessionId.slice(0, 8)}... [${elapsed()}]`);
   return { sessionId, text, costUsd, errorSubtype };
 }
 
@@ -114,18 +132,25 @@ export async function runRedTeam(
   targetPath: string,
   maxExchanges: number,
   abortController: AbortController,
+  plugins: PluginConfig[] = [],
 ): Promise<RedTeamResult> {
   const startTime = Date.now();
   let totalCostUsd = 0;
   let exchangeCount = 0;
 
-  const redTeamPrompt = await loadPrompt("prompts/red-team.md");
+  const redTeamPrompt = PROMPTS.redTeam;
+  const claudePath = getClaudePath();
   const missionContext = formatMissionContext(mission);
   const resolvedTargetPath = resolve(targetPath);
+
+  // Build clean env without CLAUDECODE to allow nested sessions
+  const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
 
   // Attacker base options (no tools — purely conversational)
   const attackerBaseOpts = {
     model: "claude-opus-4-6",
+    pathToClaudeCodeExecutable: claudePath,
+    env: cleanEnv,
     systemPrompt: redTeamPrompt,
     tools: [] as string[],
     permissionMode: "bypassPermissions",
@@ -136,12 +161,15 @@ export async function runRedTeam(
   // Target base options (full Claude Code)
   const targetBaseOpts = {
     model: "claude-opus-4-6",
+    pathToClaudeCodeExecutable: claudePath,
+    env: cleanEnv,
     cwd: resolvedTargetPath,
     systemPrompt: { type: "preset", preset: "claude_code" } as const,
     settingSources: ["project"] as string[],
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
     maxTurns: 50,
+    plugins: plugins.length > 0 ? plugins : undefined,
   };
 
   let attackerSessionId = "";
@@ -151,30 +179,39 @@ export async function runRedTeam(
 
   const firstPrompt = mission.objective + "\n\n" + missionContext;
 
-  const atk1 = await callSDK(firstPrompt, attackerBaseOpts, abortController);
+  debug(`red-team: === Exchange 1/${maxExchanges} ===`);
+  debug(`red-team: calling attacker (initial mission brief)`);
+  const atk1 = await callSDK(firstPrompt, attackerBaseOpts, abortController, "attacker[1]");
   attackerSessionId = atk1.sessionId;
   totalCostUsd += atk1.costUsd;
 
   if (!atk1.text.trim() || abortController.signal.aborted) {
+    debug(`red-team: attacker produced no text or aborted — exiting early`);
     return makeResult(mission, "", 0, startTime, totalCostUsd, resolvedTargetPath);
   }
 
   exchangeCount++;
+  debug(`red-team: attacker opening (${atk1.text.length} chars): "${atk1.text.slice(0, 120).replace(/\n/g, " ")}..."`);
 
   // Send attacker's opening to target
-  const tgt1 = await callSDK(atk1.text, targetBaseOpts, abortController);
+  debug(`red-team: calling target with attacker's opening`);
+  const tgt1 = await callSDK(atk1.text, targetBaseOpts, abortController, "target[1]");
   targetSessionId = tgt1.sessionId;
   totalCostUsd += tgt1.costUsd;
 
   if (abortController.signal.aborted) {
+    debug(`red-team: aborted after first target call`);
     return makeResult(mission, targetSessionId, exchangeCount, startTime, totalCostUsd, resolvedTargetPath);
   }
 
+  debug(`red-team: target response (${tgt1.text.length} chars): "${tgt1.text.slice(0, 120).replace(/\n/g, " ")}..."`);
   let lastTargetText = tgt1.text;
 
   // ── Exchanges 2..N: Resume both sessions alternately ──────────────────────
 
   while (exchangeCount < maxExchanges && !abortController.signal.aborted) {
+    debug(`red-team: === Exchange ${exchangeCount + 1}/${maxExchanges} ===`);
+
     // If target produced no text, conversation stalled
     if (!lastTargetText.trim()) {
       printWarning("Target produced no text response, ending conversation");
@@ -182,30 +219,41 @@ export async function runRedTeam(
     }
 
     // Resume attacker with target's response
+    debug(`red-team: resuming attacker with target's response (${lastTargetText.length} chars)`);
     const atkResult = await callSDK(lastTargetText, {
       ...attackerBaseOpts,
       resume: attackerSessionId,
-    }, abortController);
+    }, abortController, `attacker[${exchangeCount + 1}]`);
     totalCostUsd += atkResult.costUsd;
 
     if (!atkResult.text.trim() || abortController.signal.aborted) {
+      debug(`red-team: attacker produced no text or aborted — stopping relay`);
       break;
     }
 
     exchangeCount++;
+    debug(`red-team: attacker msg (${atkResult.text.length} chars): "${atkResult.text.slice(0, 120).replace(/\n/g, " ")}..."`);
 
     // Resume target with attacker's next message
+    debug(`red-team: resuming target with attacker's message`);
     const tgtResult = await callSDK(atkResult.text, {
       ...targetBaseOpts,
       resume: targetSessionId,
-    }, abortController);
+    }, abortController, `target[${exchangeCount}]`);
     totalCostUsd += tgtResult.costUsd;
 
     lastTargetText = tgtResult.text;
+    debug(`red-team: target response (${tgtResult.text.length} chars): "${tgtResult.text.slice(0, 120).replace(/\n/g, " ")}..."`);
 
-    if (tgtResult.errorSubtype || abortController.signal.aborted) {
+    if (tgtResult.errorSubtype) {
+      debug(`red-team: target error — ${tgtResult.errorSubtype}, stopping relay`);
       break;
     }
+    if (abortController.signal.aborted) {
+      debug(`red-team: aborted`);
+      break;
+    }
+    debug(`red-team: exchange ${exchangeCount} complete, total cost so far: $${totalCostUsd.toFixed(3)}`);
   }
 
   return makeResult(mission, targetSessionId, exchangeCount, startTime, totalCostUsd, resolvedTargetPath);

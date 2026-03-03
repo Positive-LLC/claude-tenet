@@ -3,21 +3,18 @@ import type {
   BlueTeamReport,
   Inventory,
   Mission,
+  PluginConfig,
   RedTeamResult,
 } from "../types.ts";
 import { BLUE_TEAM_REPORT_SCHEMA } from "../types.ts";
-import { parseSessionFile, formatSessionForPrompt } from "./session-reader.ts";
-import { printWarning } from "../utils/logger.ts";
+import { extractSessionId, readSessionJSONL } from "./session-reader.ts";
+import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
-
-async function loadPrompt(path: string): Promise<string> {
-  const scriptDir = new URL(".", import.meta.url).pathname;
-  const projectRoot = resolve(scriptDir, "..", "..");
-  return await Deno.readTextFile(resolve(projectRoot, path));
-}
+import { PROMPTS } from "../prompts.ts";
+import { getClaudePath } from "../utils/claude-path.ts";
 
 function buildBlueTeamPrompt(
-  sessionText: string,
+  rawJSONL: string,
   sessionId: string,
   mission: Mission,
   inventory: Inventory,
@@ -40,13 +37,17 @@ function buildBlueTeamPrompt(
       (c) => `- [${c.type}] ${c.id}: ${c.filePath} — ${c.description.slice(0, 100)}`,
     ),
     ``,
-    `## Session Transcript`,
+    `## Raw Session Data`,
     ``,
-    sessionText,
+    `Below is the raw JSONL from the red team session. Parse it to understand what happened — each line is a JSON object representing a message. Refer to the JSONL Format Reference in your system prompt for the schema.`,
+    ``,
+    "```jsonl",
+    rawJSONL,
+    "```",
     ``,
     `## Instructions`,
     ``,
-    `1. Read the session transcript above carefully`,
+    `1. Parse the raw JSONL session data above carefully`,
     `2. For each target component (${mission.targetComponents.join(", ")}), determine if it was invoked and whether it behaved correctly`,
     `3. Identify any issues in the agent's behavior (use the issue categories from your system prompt)`,
     `4. Read the relevant project files using your tools to understand root causes`,
@@ -83,6 +84,7 @@ export async function runBlueTeam(
   inventory: Inventory,
   targetPath: string,
   abortController: AbortController,
+  plugins: PluginConfig[] = [],
 ): Promise<BlueTeamReport> {
   // If no session file, return empty report
   if (!redResult.sessionFilePath) {
@@ -100,24 +102,36 @@ export async function runBlueTeam(
     return makeEmptyReport(redResult.sessionId, mission.missionId);
   }
 
-  // Parse the session
-  const parsedSession = await parseSessionFile(redResult.sessionFilePath);
-  const sessionText = formatSessionForPrompt(parsedSession);
+  // Read the raw session data
+  debug(`blue-team: reading session file: ${redResult.sessionFilePath}`);
+  const sessionId = await extractSessionId(redResult.sessionFilePath) || redResult.sessionId;
+  const rawJSONL = await readSessionJSONL(redResult.sessionFilePath);
+  debug(`blue-team: session data — ${rawJSONL.length} chars, sessionId=${sessionId.slice(0, 8)}...`);
 
-  const blueTeamSystemPrompt = await loadPrompt("prompts/blue-team.md");
-  const sessionId = parsedSession.sessionId || redResult.sessionId;
-  const prompt = buildBlueTeamPrompt(sessionText, sessionId, mission, inventory);
+  const blueTeamSystemPrompt = PROMPTS.blueTeam;
+  const claudePath = getClaudePath();
+  const prompt = buildBlueTeamPrompt(rawJSONL, sessionId, mission, inventory);
+  debug(`blue-team: prompt built — ${prompt.length} chars`);
+
+  // Build clean env without CLAUDECODE to allow nested sessions
+  const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
+
+  debug(`blue-team: starting SDK call — claudePath=${claudePath}, cwd=${resolve(targetPath)}`);
+  const elapsed = startTimer();
 
   const blueQuery = query({
     prompt,
     options: {
       model: "claude-opus-4-6",
+      pathToClaudeCodeExecutable: claudePath,
+      env: cleanEnv,
       cwd: resolve(targetPath),
       systemPrompt: blueTeamSystemPrompt,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       outputFormat: { type: "json_schema", schema: BLUE_TEAM_REPORT_SCHEMA },
       maxTurns: 50,
+      plugins: plugins.length > 0 ? plugins : undefined,
       abortController,
     },
   });
@@ -125,23 +139,34 @@ export async function runBlueTeam(
   let report: BlueTeamReport | null = null;
 
   try {
+    let msgCount = 0;
     for await (const msg of blueQuery) {
-      if (abortController.signal.aborted) break;
+      msgCount++;
+      if (abortController.signal.aborted) {
+        debug(`blue-team: aborted after ${msgCount} messages [${elapsed()}]`);
+        break;
+      }
+
+      const subtype = "subtype" in msg ? `:${msg.subtype}` : "";
+      debug(`blue-team: msg #${msgCount} type=${msg.type}${subtype} [${elapsed()}]`);
 
       if (msg.type === "result") {
         if (msg.subtype === "success" && msg.structured_output) {
           report = msg.structured_output as BlueTeamReport;
+          debug(`blue-team: got structured report — ${report.issuesFound.length} issues, ${report.fixesApplied.length} fixes [${elapsed()}]`);
         } else if (msg.subtype !== "success") {
           printWarning(`Blue team ended with: ${msg.subtype}`);
         }
         break;
       }
     }
+    debug(`blue-team: stream ended — ${msgCount} messages [${elapsed()}]`);
   } catch (err) {
     if (!abortController.signal.aborted) {
       printWarning(`Blue team error: ${err}`);
+      debug(`blue-team: EXCEPTION — ${err} [${elapsed()}]`);
     }
   }
 
-  return report || makeEmptyReport(parsedSession.sessionId || redResult.sessionId, mission.missionId);
+  return report || makeEmptyReport(sessionId, mission.missionId);
 }

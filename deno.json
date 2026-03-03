@@ -9,6 +9,6 @@
   "tasks": {
     "start": "deno run --allow-all src/main.ts",
     "check": "deno check src/main.ts",
-    "compile": "deno compile --allow-all --output tenet src/main.ts"
+    "compile": "deno compile --allow-all --include prompts/ --output tenet src/main.ts"
   }
 }

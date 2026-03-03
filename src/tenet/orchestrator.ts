@@ -14,15 +14,26 @@ import {
   printDryRunMission,
   printError,
   printWarning,
+  debug,
+  startTimer,
+  setVerbose,
 } from "../utils/logger.ts";
 
 export async function runTenet(
   config: TenetConfig,
   abortController: AbortController,
 ): Promise<void> {
+  // Enable verbose logging if requested
+  setVerbose(config.verbose);
+
+  const totalElapsed = startTimer();
+
   // Step 1: Initial scan
   console.log("  Scanning target project...\n");
+  debug(`orchestrator: scanning ${config.targetPath}`);
+  const phaseTimer = startTimer();
   const inventory = await scanProject(config.targetPath);
+  debug(`orchestrator: scan complete [${phaseTimer()}]`);
   printScanResult(inventory);
 
   if (inventory.components.length === 0) {
@@ -70,6 +81,8 @@ export async function runTenet(
 
     // Generate mission
     console.log(`  Generating mission for round ${round}...\n`);
+    let missionTimer = startTimer();
+    debug(`orchestrator: generating mission for round ${round}`);
     const mission = await generateMission(
       currentInventory,
       coverage,
@@ -78,12 +91,15 @@ export async function runTenet(
       config.maxExchanges,
       abortController,
     );
+    debug(`orchestrator: mission generated [${missionTimer()}]`);
 
     if (abortController.signal.aborted) break;
     printRoundStart(round, config.rounds, mission);
 
     // Red team
     console.log("  Running red team...\n");
+    missionTimer = startTimer();
+    debug(`orchestrator: starting red team — maxExchanges=${config.maxExchanges}`);
     let redResult;
     try {
       redResult = await runRedTeam(
@@ -91,9 +107,12 @@ export async function runTenet(
         config.targetPath,
         config.maxExchanges,
         abortController,
+        currentInventory.plugins,
       );
+      debug(`orchestrator: red team done [${missionTimer()}] — ${redResult.conversationTurns} turns, $${redResult.costUsd.toFixed(2)}`);
       printRedTeamResult(redResult);
     } catch (err) {
+      debug(`orchestrator: red team THREW [${missionTimer()}] — ${err}`);
       printError("Red team failed", err);
       continue;
     }
@@ -102,6 +121,8 @@ export async function runTenet(
 
     // Blue team
     console.log("  Running blue team...\n");
+    missionTimer = startTimer();
+    debug(`orchestrator: starting blue team — sessionFile=${redResult.sessionFilePath}`);
     let blueReport;
     try {
       blueReport = await runBlueTeam(
@@ -110,9 +131,12 @@ export async function runTenet(
         currentInventory,
         config.targetPath,
         abortController,
+        currentInventory.plugins,
       );
+      debug(`orchestrator: blue team done [${missionTimer()}] — ${blueReport.issuesFound.length} issues`);
       printBlueTeamResult(blueReport);
     } catch (err) {
+      debug(`orchestrator: blue team THREW [${missionTimer()}] — ${err}`);
       printError("Blue team failed", err);
       continue;
     }
@@ -138,4 +162,5 @@ export async function runTenet(
   if (coverage.rounds.length > 0) {
     printFinalSummary(coverage);
   }
+  debug(`orchestrator: total runtime [${totalElapsed()}]`);
 }

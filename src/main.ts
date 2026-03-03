@@ -11,7 +11,7 @@ Adversarial testing framework for markdown-based Claude agent projects.
 
 Options:
   -r, --rounds <n>          Number of competition rounds (default: 3)
-  -e, --max-exchanges <n>   Max conversation turns per red team session (default: 15)
+  -e, --max-exchanges <n>   Max conversation turns per red team session (default: 3)
   -t, --target <path>       Target project path (default: cwd)
   -v, --verbose             Show full session transcripts in output
       --dry-run             Scan and generate first mission only, don't execute
@@ -38,7 +38,7 @@ function parseConfig(): TenetConfig {
 
   const rounds = parseInt(String(args.rounds || "3"), 10);
   const maxExchanges = parseInt(
-    String(args["max-exchanges"] || "15"),
+    String(args["max-exchanges"] || "3"),
     10,
   );
   const targetPath = String(args.target || Deno.cwd());

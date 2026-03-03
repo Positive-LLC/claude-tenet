@@ -1,14 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { CoverageState, Inventory, Mission } from "../types.ts";
 import { MISSION_SCHEMA } from "../types.ts";
-import { printWarning } from "../utils/logger.ts";
-import { resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
-
-async function loadPrompt(path: string): Promise<string> {
-  const scriptDir = new URL(".", import.meta.url).pathname;
-  const projectRoot = resolve(scriptDir, "..", "..");
-  return await Deno.readTextFile(resolve(projectRoot, path));
-}
+import { printWarning, debug, startTimer } from "../utils/logger.ts";
+import { PROMPTS } from "../prompts.ts";
+import { getClaudePath } from "../utils/claude-path.ts";
 
 function buildMissionPrompt(
   inventory: Inventory,
@@ -76,7 +71,8 @@ export async function generateMission(
   maxExchanges: number,
   abortController: AbortController,
 ): Promise<Mission> {
-  const tenetPrompt = await loadPrompt("prompts/tenet.md");
+  const tenetPrompt = PROMPTS.tenet;
+  const claudePath = getClaudePath();
   const prompt = buildMissionPrompt(
     inventory,
     coverage,
@@ -85,10 +81,18 @@ export async function generateMission(
     maxExchanges,
   );
 
+  // Build clean env without CLAUDECODE to allow nested sessions
+  const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
+
+  debug(`mission: starting SDK call — prompt ${prompt.length} chars, claudePath=${claudePath}`);
+  const elapsed = startTimer();
+
   const missionQuery = query({
     prompt,
     options: {
       model: "claude-opus-4-6",
+      pathToClaudeCodeExecutable: claudePath,
+      env: cleanEnv,
       systemPrompt: tenetPrompt,
       tools: [],
       outputFormat: { type: "json_schema", schema: MISSION_SCHEMA },
@@ -103,25 +107,37 @@ export async function generateMission(
   let mission: Mission | null = null;
 
   try {
+    let msgCount = 0;
     for await (const msg of missionQuery) {
-      if (abortController.signal.aborted) break;
+      msgCount++;
+      if (abortController.signal.aborted) {
+        debug(`mission: aborted after ${msgCount} messages [${elapsed()}]`);
+        break;
+      }
+
+      const subtype = "subtype" in msg ? `:${msg.subtype}` : "";
+      debug(`mission: msg #${msgCount} type=${msg.type}${subtype} [${elapsed()}]`);
 
       if (msg.type === "result") {
         if (msg.subtype === "success" && msg.structured_output) {
           mission = msg.structured_output as Mission;
+          debug(`mission: got structured output — objective: "${mission.objective.slice(0, 80)}..." [${elapsed()}]`);
         } else if (msg.subtype !== "success") {
           printWarning(`Mission generation ended with: ${msg.subtype}`);
         }
         break;
       }
     }
+    debug(`mission: stream ended — ${msgCount} messages [${elapsed()}]`);
   } catch (err) {
     if (!abortController.signal.aborted) {
       printWarning(`Mission generation error: ${err}`);
+      debug(`mission: EXCEPTION — ${err} [${elapsed()}]`);
     }
   }
 
   if (!mission) {
+    debug(`mission: using fallback mission [${elapsed()}]`);
     // Fallback: generate a basic mission
     const uncovered = inventory.components.filter(
       (c) => !coverage.components[c.id]?.covered,

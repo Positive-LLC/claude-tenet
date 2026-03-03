@@ -8,6 +8,7 @@ export type ComponentType =
   | "knowledge"
   | "hook"
   | "mcp_server"
+  | "plugin"
   | "other_md";
 
 export interface Component {
@@ -18,10 +19,16 @@ export interface Component {
   description: string;
 }
 
+export interface PluginConfig {
+  type: "local";
+  path: string;
+}
+
 export interface Inventory {
   projectPath: string;
   scannedAt: string;
   components: Component[];
+  plugins: PluginConfig[];
 }
 
 // ─── Mission ────────────────────────────────────────────────────────────────
@@ -139,24 +146,6 @@ export interface TenetConfig {
   targetPath: string;
   verbose: boolean;
   dryRun: boolean;
-}
-
-// ─── Session Reader ─────────────────────────────────────────────────────────
-
-export interface ParsedSession {
-  sessionId: string;
-  turns: ParsedTurn[];
-  toolsUsed: string[];
-  filesAccessed: string[];
-  errors: string[];
-}
-
-export interface ParsedTurn {
-  turnNumber: number;
-  role: "user" | "assistant";
-  text: string;
-  toolCalls?: { name: string; inputSummary: string; outputSummary: string }[];
-  timestamp: string;
 }
 
 // ─── JSON Schemas (for SDK structured output) ───────────────────────────────
