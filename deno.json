@@ -1,0 +1,14 @@
+{
+  "imports": {
+    "@anthropic-ai/claude-agent-sdk": "npm:@anthropic-ai/claude-agent-sdk@0.2.7"
+  },
+  "compilerOptions": {
+    "strict": true
+  },
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "start": "deno run --allow-all src/main.ts",
+    "check": "deno check src/main.ts",
+    "compile": "deno compile --allow-all --output tenet src/main.ts"
+  }
+}
