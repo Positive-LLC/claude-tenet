@@ -1,4 +1,4 @@
-import type { TenetConfig } from "../types.ts";
+import type { Inventory, TenetConfig } from "../types.ts";
 import { scanProject } from "./scanner.ts";
 import { generateMission } from "./mission.ts";
 import { initCoverage, updateCoverage, getCoverageStats } from "./coverage.ts";
@@ -18,6 +18,7 @@ import {
   startTimer,
   setVerbose,
 } from "../utils/logger.ts";
+import { multiSelect } from "../utils/multiselect.ts";
 
 export async function runTenet(
   config: TenetConfig,
@@ -44,6 +45,16 @@ export async function runTenet(
     return;
   }
 
+  // Prompt user for priority components
+  const priorityComponents = await multiSelect({
+    title: "Any components you want to prioritize for testing?",
+    hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc test all equally",
+    items: inventory.components.map((c) => ({
+      label: `[${c.type}] ${c.id.replace(/^[^:]+:/, "")}`,
+      value: c.id,
+    })),
+  });
+
   // Initialize coverage
   const coverage = initCoverage(inventory);
 
@@ -57,6 +68,7 @@ export async function runTenet(
       config.rounds,
       config.maxExchanges,
       abortController,
+      priorityComponents,
     );
     printDryRunMission(mission);
     return;
@@ -90,6 +102,7 @@ export async function runTenet(
       config.rounds,
       config.maxExchanges,
       abortController,
+      priorityComponents,
     );
     debug(`orchestrator: mission generated [${missionTimer()}]`);
 

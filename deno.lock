@@ -1,7 +1,8 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@anthropic-ai/claude-agent-sdk@0.2.7": "0.2.7_zod@4.3.6"
+    "npm:@anthropic-ai/claude-agent-sdk@0.2.7": "0.2.7_zod@4.3.6",
+    "npm:@types/node@*": "24.2.0"
   },
   "npm": {
     "@anthropic-ai/claude-agent-sdk@0.2.7_zod@4.3.6": {
@@ -115,6 +116,15 @@
       "integrity": "sha512-MpY/o8/8kj+EcnxwvrP4aTJSWw/aZ7JIGR4aBeZkZw5B7/Jn+tY9/VNwtcoGmdT7GfggGIU4kygOMSbYnOrAbg==",
       "os": ["win32"],
       "cpu": ["x64"]
+    },
+    "@types/node@24.2.0": {
+      "integrity": "sha512-3xyG3pMCq3oYCNg7/ZP+E1ooTaGB4cG8JWRsqqOYQdbWNY4zbaV0Ennrd7stjiJEFZCaybcIgpTjJWHRfBSIDw==",
+      "dependencies": [
+        "undici-types"
+      ]
+    },
+    "undici-types@7.10.0": {
+      "integrity": "sha512-t5Fy/nfn+14LuOc2KNYg75vZqClpAiqscVvMygNnlsHBFpSXdJaYtXMcdNLpl/Qvc3P2cB3s6lOV51nqsFq4ag=="
     },
     "zod@4.3.6": {
       "integrity": "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="

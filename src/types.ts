@@ -8,7 +8,6 @@ export type ComponentType =
   | "knowledge"
   | "hook"
   | "mcp_server"
-  | "plugin"
   | "other_md";
 
 export interface Component {

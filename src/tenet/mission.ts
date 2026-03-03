@@ -11,7 +11,9 @@ function buildMissionPrompt(
   round: number,
   totalRounds: number,
   maxExchanges: number,
+  priorityComponents: string[] = [],
 ): string {
+  const prioritySet = new Set(priorityComponents);
   const componentsWithCoverage = inventory.components.map((c) => {
     const status = coverage.components[c.id];
     return {
@@ -23,6 +25,7 @@ function buildMissionPrompt(
       covered: status?.covered ?? false,
       issueCount: status?.issueCount ?? 0,
       fixCount: status?.fixCount ?? 0,
+      priority: prioritySet.has(c.id),
     };
   });
 
@@ -57,6 +60,16 @@ function buildMissionPrompt(
     ``,
     `## Instructions`,
     `Generate a Mission JSON targeting the highest-priority uncovered components.`,
+    ...(priorityComponents.length > 0
+      ? [
+          ``,
+          `## User-Specified Priority Components`,
+          `The user has flagged the following components as especially important to test.`,
+          `Prioritize these in mission targeting — they should be tested first and more thoroughly:`,
+          ...priorityComponents.map((id) => `  - ${id}`),
+        ]
+      : []),
+    ``,
     `Set the round field to ${round}.`,
     `Generate a UUID for missionId.`,
     `Keep estimatedTurns <= ${maxExchanges}.`,
@@ -70,6 +83,7 @@ export async function generateMission(
   totalRounds: number,
   maxExchanges: number,
   abortController: AbortController,
+  priorityComponents: string[] = [],
 ): Promise<Mission> {
   const tenetPrompt = PROMPTS.tenet;
   const claudePath = getClaudePath();
@@ -79,6 +93,7 @@ export async function generateMission(
     round,
     totalRounds,
     maxExchanges,
+    priorityComponents,
   );
 
   // Build clean env without CLAUDECODE to allow nested sessions
@@ -138,19 +153,23 @@ export async function generateMission(
 
   if (!mission) {
     debug(`mission: using fallback mission [${elapsed()}]`);
-    // Fallback: generate a basic mission
+    // Fallback: generate a basic mission (prefer priority components)
     const uncovered = inventory.components.filter(
       (c) => !coverage.components[c.id]?.covered,
     );
-    const targets = uncovered.slice(0, 3).map((c) => c.id);
+    const prioritySet = new Set(priorityComponents);
+    const sorted = uncovered.length > 0
+      ? [...uncovered].sort((a, b) =>
+          (prioritySet.has(b.id) ? 1 : 0) - (prioritySet.has(a.id) ? 1 : 0)
+        )
+      : inventory.components;
+    const targets = sorted.slice(0, 3).map((c) => c.id);
 
     mission = {
       missionId: crypto.randomUUID(),
       round,
       objective: `Test the following components: ${targets.join(", ")}`,
-      targetComponents: targets.length > 0
-        ? targets
-        : inventory.components.slice(0, 3).map((c) => c.id),
+      targetComponents: targets,
       persona: "A general user exploring the agent's capabilities",
       conversationStarters: [
         "Hi, I need some help with a task.",

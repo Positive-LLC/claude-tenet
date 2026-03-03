@@ -1,7 +1,7 @@
 import type { Component, ComponentType, Inventory, PluginConfig } from "../types.ts";
 import { join, resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { homedir } from "node:os";
-import { debug } from "../utils/logger.ts";
+import { debug, printWarning } from "../utils/logger.ts";
 
 export async function scanProject(projectPath: string): Promise<Inventory> {
   const absPath = resolve(projectPath);
@@ -323,16 +323,12 @@ async function discoverPlugins(
       debug(`plugins: matched "${installedKey}" (scope=${entry.scope}) → ${entry.installPath}`);
       pluginConfigs.push({ type: "local", path: entry.installPath });
 
-      components.push({
-        id: `plugin:${installedKey}`,
-        type: "plugin",
-        name: installedKey,
-        filePath: entry.installPath,
-        description: `Plugin: ${installedKey} (scope=${entry.scope})`,
-      });
-
       // Extract granular sub-components (skills, commands, agents) from the plugin
+      const before = components.length;
       await scanPluginContents(namePrefix, entry.installPath, components);
+      if (components.length === before) {
+        printWarning(`Plugin "${installedKey}" has no discoverable components (skills, commands, agents)`);
+      }
     }
   }
 

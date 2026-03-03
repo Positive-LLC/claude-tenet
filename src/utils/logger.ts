@@ -48,11 +48,7 @@ ${SEPARATOR}
 
 export function printScanResult(inventory: Inventory): void {
   console.log(`  Scanned: ${inventory.projectPath}`);
-  console.log(`  Components found: ${inventory.components.length}`);
-  for (const c of inventory.components) {
-    console.log(`    [${pad(c.type, 12)}] ${c.id}`);
-  }
-  console.log();
+  console.log(`  Components found: ${inventory.components.length}\n`);
 }
 
 export function printRoundStart(
