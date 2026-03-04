@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="hn12404988/claude-tenet"
+REPO="Positive-LLC/claude-tenet"
 INSTALL_DIR="${TENET_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY="tenet"
 

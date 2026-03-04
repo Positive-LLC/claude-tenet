@@ -10,7 +10,7 @@ Adversarial testing framework for Claude Code agent projects. It runs automated 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hn12404988/claude-tenet/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Positive-LLC/claude-tenet/main/install.sh | sh
 ```
 
 This installs the latest release to `~/.local/bin/tenet`. Run it again anytime to update. Set `TENET_INSTALL_DIR` to change the install location.
@@ -38,4 +38,4 @@ tenet --dry-run                    # scan + generate first mission only
 
 ## Contributing
 
-PRs and issues are welcome — open one at [github.com/hn12404988/claude-tenet](https://github.com/hn12404988/claude-tenet).
+PRs and issues are welcome — open one at [github.com/Positive-LLC/claude-tenet](https://github.com/Positive-LLC/claude-tenet).
