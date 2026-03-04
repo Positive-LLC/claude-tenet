@@ -139,9 +139,8 @@ export function printRoundComplete(
     console.log(`  Issues Found: ${blueReport.issuesFound.length}`);
     for (const issue of blueReport.issuesFound) {
       console.log(
-        `    [${issue.severity.toUpperCase()}] ${issue.category}: ${issue.description}`,
+        `    • [${issue.severity.toUpperCase()}] ${issue.category}: ${issue.description}`,
       );
-      console.log();
     }
     console.log();
   }
@@ -151,9 +150,8 @@ export function printRoundComplete(
     console.log(`  Fixes Applied: ${blueReport.fixesApplied.length}`);
     for (const fix of blueReport.fixesApplied) {
       console.log(
-        `    ${fix.changeType === "modified" ? "Modified" : "Created"}: ${fix.filePath} \u2014 ${fix.description}`,
+        `    • ${fix.changeType === "modified" ? "Modified" : "Created"}: ${fix.filePath} \u2014 ${fix.description}`,
       );
-      console.log();
     }
   }
 
