@@ -141,6 +141,7 @@ export function printRoundComplete(
       console.log(
         `    [${issue.severity.toUpperCase()}] ${issue.category}: ${issue.description}`,
       );
+      console.log();
     }
     console.log();
   }
@@ -152,8 +153,8 @@ export function printRoundComplete(
       console.log(
         `    ${fix.changeType === "modified" ? "Modified" : "Created"}: ${fix.filePath} \u2014 ${fix.description}`,
       );
+      console.log();
     }
-    console.log();
   }
 
   console.log(
