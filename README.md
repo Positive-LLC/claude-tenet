@@ -2,6 +2,11 @@
 
 Adversarial testing framework for Claude Code agent projects. It runs automated red team vs blue team simulations to find and fix issues in your agent's markdown configuration — CLAUDE.md, skills, commands, hooks, MCP servers, and more.
 
+## Prerequisites
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
+- Logged in via `claude` or have `ANTHROPIC_API_KEY` set in your environment
+
 ## Install
 
 ```sh
