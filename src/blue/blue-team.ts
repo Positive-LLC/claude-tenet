@@ -1,17 +1,49 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
   BlueTeamReport,
+  ComponentType,
   Inventory,
   Mission,
   PluginConfig,
   RedTeamResult,
 } from "../types.ts";
-import { BLUE_TEAM_REPORT_SCHEMA } from "../types.ts";
+import { BLUE_TEAM_REPORT_SCHEMA, MIN_OK_GUIDANCE } from "../types.ts";
 import { extractSessionId, readSessionJSONL } from "./session-reader.ts";
 import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { PROMPTS } from "../prompts.ts";
 import { getClaudePath } from "../utils/claude-path.ts";
+
+function buildGuidanceSection(
+  inventory: Inventory,
+  mission: Mission,
+): string[] {
+  // Collect types of targeted components
+  const targetedTypes = new Set<ComponentType>();
+  const targetSet = new Set(mission.targetComponents);
+  for (const c of inventory.components) {
+    if (targetSet.has(c.id)) {
+      targetedTypes.add(c.type);
+    }
+  }
+
+  const lines: string[] = [];
+  for (const type of targetedTypes) {
+    const guidance = MIN_OK_GUIDANCE[type];
+    if (guidance) {
+      lines.push(`- **${type}**: ${guidance}`);
+    }
+  }
+
+  if (lines.length === 0) return [];
+
+  return [
+    `## Type-Specific Evaluation Guidance`,
+    ``,
+    ...lines,
+    ``,
+  ];
+}
 
 function buildBlueTeamPrompt(
   rawJSONL: string,
@@ -37,6 +69,7 @@ function buildBlueTeamPrompt(
       (c) => `- [${c.type}] ${c.id}: ${c.filePath} — ${c.description.slice(0, 100)}`,
     ),
     ``,
+    ...buildGuidanceSection(inventory, mission),
     `## Raw Session Data`,
     ``,
     `Below is the raw JSONL from the red team session. Parse it to understand what happened — each line is a JSON object representing a message. Refer to the JSONL Format Reference in your system prompt for the schema.`,

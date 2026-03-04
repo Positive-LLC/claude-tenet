@@ -13,7 +13,8 @@ function buildMissionPrompt(
   maxExchanges: number,
   priorityComponents: string[] = [],
 ): string {
-  const prioritySet = new Set(priorityComponents);
+  const total = priorityComponents.length;
+  const priorityMap = new Map(priorityComponents.map((id, i) => [id, total - i]));
   const componentsWithCoverage = inventory.components.map((c) => {
     const status = coverage.components[c.id];
     return {
@@ -25,7 +26,7 @@ function buildMissionPrompt(
       covered: status?.covered ?? false,
       issueCount: status?.issueCount ?? 0,
       fixCount: status?.fixCount ?? 0,
-      priority: prioritySet.has(c.id),
+      priority: priorityMap.get(c.id) ?? 0,
     };
   });
 
@@ -60,15 +61,11 @@ function buildMissionPrompt(
     ``,
     `## Instructions`,
     `Generate a Mission JSON targeting the highest-priority uncovered components.`,
-    ...(priorityComponents.length > 0
-      ? [
-          ``,
-          `## User-Specified Priority Components`,
-          `The user has flagged the following components as especially important to test.`,
-          `Prioritize these in mission targeting — they should be tested first and more thoroughly:`,
-          ...priorityComponents.map((id) => `  - ${id}`),
-        ]
-      : []),
+    ``,
+    `## Component Priority`,
+    `Components have a numeric \`priority\` field (higher number = higher priority).`,
+    `After accounting for coverage status (untested > has-issues > covered),`,
+    `prefer higher-priority components.`,
     ``,
     `Set the round field to ${round}.`,
     `Generate a UUID for missionId.`,
@@ -153,16 +150,14 @@ export async function generateMission(
 
   if (!mission) {
     debug(`mission: using fallback mission [${elapsed()}]`);
-    // Fallback: generate a basic mission (prefer priority components)
+    // Fallback: generate a basic mission (sort by position in priorityComponents)
     const uncovered = inventory.components.filter(
       (c) => !coverage.components[c.id]?.covered,
     );
-    const prioritySet = new Set(priorityComponents);
+    const rankMap = new Map(priorityComponents.map((id, i) => [id, i]));
     const sorted = uncovered.length > 0
-      ? [...uncovered].sort((a, b) =>
-          (prioritySet.has(b.id) ? 1 : 0) - (prioritySet.has(a.id) ? 1 : 0)
-        )
-      : inventory.components;
+      ? [...uncovered].sort((a, b) => (rankMap.get(a.id) ?? 999) - (rankMap.get(b.id) ?? 999))
+      : [...inventory.components].sort((a, b) => (rankMap.get(a.id) ?? 999) - (rankMap.get(b.id) ?? 999));
     const targets = sorted.slice(0, 3).map((c) => c.id);
 
     mission = {

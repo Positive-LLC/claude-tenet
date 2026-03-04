@@ -10,6 +10,24 @@ export type ComponentType =
   | "mcp_server"
   | "other_md";
 
+export const DEFAULT_TYPE_PRIORITY: Record<ComponentType, number> = {
+  skill: 8,
+  claude_md: 7,
+  knowledge: 6,
+  agent: 5,
+  other_md: 4,
+  hook: 3,
+  command: 2,
+  mcp_server: 1,
+};
+
+export const MIN_OK_GUIDANCE: Partial<Record<ComponentType, string>> = {
+  mcp_server:
+    "As long as the MCP server was invoked and returned a result without error, " +
+    "mark it as behaviorCorrect=true. There are too many tools to verify each one. " +
+    "Only flag behaviorCorrect=false if the server produced an explicit error or failed to respond.",
+};
+
 export interface Component {
   id: string;
   type: ComponentType;

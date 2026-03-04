@@ -1,4 +1,5 @@
 import type { Inventory, TenetConfig } from "../types.ts";
+import { DEFAULT_TYPE_PRIORITY } from "../types.ts";
 import { scanProject } from "./scanner.ts";
 import { generateMission } from "./mission.ts";
 import { initCoverage, updateCoverage, getCoverageStats } from "./coverage.ts";
@@ -46,14 +47,22 @@ export async function runTenet(
   }
 
   // Prompt user for priority components
-  const priorityComponents = await multiSelect({
+  const userSelected = await multiSelect({
     title: "Any components you want to prioritize for testing?",
-    hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc test all equally",
+    hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
     items: inventory.components.map((c) => ({
       label: `[${c.type}] ${c.id.replace(/^[^:]+:/, "")}`,
       value: c.id,
     })),
   });
+
+  // Build full sorted priority list: user-selected first, then remaining by type priority
+  const userSelectedSet = new Set(userSelected);
+  const remaining = inventory.components
+    .filter((c) => !userSelectedSet.has(c.id))
+    .sort((a, b) => DEFAULT_TYPE_PRIORITY[b.type] - DEFAULT_TYPE_PRIORITY[a.type])
+    .map((c) => c.id);
+  const priorityComponents = [...userSelected, ...remaining];
 
   // Initialize coverage
   const coverage = initCoverage(inventory);

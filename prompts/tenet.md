@@ -35,6 +35,7 @@ When given an inventory of components and coverage data, generate a focused test
 - `covered: true` — Component was tested and behaved correctly in a previous round
 - `covered: false, issueCount > 0` — Component was tested but had issues (retest after fixes)
 - `covered: false, issueCount == 0` — Component has never been tested (highest priority)
+- `priority` — Numeric testing priority (higher = test first). Secondary signal after coverage status.
 
 ## Output
 

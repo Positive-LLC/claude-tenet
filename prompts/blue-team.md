@@ -67,6 +67,13 @@ Look for these categories of issues:
 - Agent lacked domain knowledge that should exist in the project's knowledge files
 - A knowledge file should be created or updated
 
+## Type-Specific Evaluation Criteria
+
+Some component types have relaxed pass/fail criteria. When the analysis prompt includes
+a "Type-Specific Evaluation Guidance" section, follow those criteria when setting
+`behaviorCorrect` for components of that type. Otherwise, use standard behavioral
+correctness analysis.
+
 ## Fix Protocol
 
 1. **Always read before editing** — Use Read/Glob/Grep tools to understand the file before making changes
