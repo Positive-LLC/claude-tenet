@@ -92,8 +92,8 @@ async function callSDK(
         sessionId = msg.session_id;
         debug(`${label}: init — session=${sessionId.slice(0, 8)}... [${elapsed()}]`);
       } else if (msg.type === "assistant") {
-        const preview = extractTextFromMessages([msg]).slice(0, 80).replace(/\n/g, " ");
-        debug(`${label}: assistant msg #${msgCount}${preview ? ` — "${preview}..."` : ""} [${elapsed()}]`);
+        const preview = extractTextFromMessages([msg]).replace(/\n/g, " ");
+        debug(`${label}: assistant msg #${msgCount}${preview ? ` — "${preview}"` : ""} [${elapsed()}]`);
       } else if (msg.type === "result") {
         costUsd = msg.total_cost_usd;
         if (msg.subtype !== "success") {
@@ -118,6 +118,10 @@ async function callSDK(
       debug(`${label}: EXCEPTION — ${err} [${elapsed()}]`);
       errorSubtype = "exception";
     }
+  } finally {
+    // Close the Query's underlying transport/child process
+    await q.return(undefined as never);
+    debug(`${label}: query closed [${elapsed()}]`);
   }
 
   const text = extractTextFromMessages(messages);
@@ -191,7 +195,7 @@ export async function runRedTeam(
   }
 
   exchangeCount++;
-  debug(`red-team: attacker opening (${atk1.text.length} chars): "${atk1.text.slice(0, 120).replace(/\n/g, " ")}..."`);
+  debug(`red-team: attacker opening (${atk1.text.length} chars):\n${atk1.text}`);
 
   // Send attacker's opening to target
   debug(`red-team: calling target with attacker's opening`);
@@ -204,7 +208,7 @@ export async function runRedTeam(
     return makeResult(mission, targetSessionId, exchangeCount, startTime, totalCostUsd, resolvedTargetPath);
   }
 
-  debug(`red-team: target response (${tgt1.text.length} chars): "${tgt1.text.slice(0, 120).replace(/\n/g, " ")}..."`);
+  debug(`red-team: target response (${tgt1.text.length} chars):\n${tgt1.text}`);
   let lastTargetText = tgt1.text;
 
   // ── Exchanges 2..N: Resume both sessions alternately ──────────────────────
@@ -232,7 +236,7 @@ export async function runRedTeam(
     }
 
     exchangeCount++;
-    debug(`red-team: attacker msg (${atkResult.text.length} chars): "${atkResult.text.slice(0, 120).replace(/\n/g, " ")}..."`);
+    debug(`red-team: attacker msg (${atkResult.text.length} chars):\n${atkResult.text}`);
 
     // Resume target with attacker's next message
     debug(`red-team: resuming target with attacker's message`);
@@ -243,7 +247,7 @@ export async function runRedTeam(
     totalCostUsd += tgtResult.costUsd;
 
     lastTargetText = tgtResult.text;
-    debug(`red-team: target response (${tgtResult.text.length} chars): "${tgtResult.text.slice(0, 120).replace(/\n/g, " ")}..."`);
+    debug(`red-team: target response (${tgtResult.text.length} chars):\n${tgtResult.text}`);
 
     if (tgtResult.errorSubtype) {
       debug(`red-team: target error — ${tgtResult.errorSubtype}, stopping relay`);

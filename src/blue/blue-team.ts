@@ -220,6 +220,9 @@ export async function runBlueTeam(
       printWarning(`Blue team error: ${err}`);
       debug(`blue-team: EXCEPTION — ${err} [${elapsed()}]`);
     }
+  } finally {
+    await blueQuery.return(undefined as never);
+    debug(`blue-team: query closed [${elapsed()}]`);
   }
 
   return report || makeEmptyReport(sessionId, mission.missionId);
