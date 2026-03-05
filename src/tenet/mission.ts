@@ -5,6 +5,11 @@ import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { PROMPTS } from "../prompts.ts";
 import { getClaudePath } from "../utils/claude-path.ts";
 
+/** Truncate a string to maxLen, appending "…" if truncated. */
+function truncate(s: string, maxLen: number): string {
+  return s.length <= maxLen ? s : s.slice(0, maxLen - 1) + "…";
+}
+
 function buildMissionPrompt(
   inventory: Inventory,
   coverage: CoverageState,
@@ -30,19 +35,42 @@ function buildMissionPrompt(
     };
   });
 
-  const previousMissions = coverage.rounds.map((r) => {
-    // Extract the objective from the blue report's mission context
-    const testedComponents = r.blueReport.componentsTested.map(
-      (ct) => ct.componentId,
-    );
-    return {
-      round: r.round,
-      missionId: r.missionId,
-      componentsTested: testedComponents,
-    };
-  });
+  // Build rich previous round summaries
+  const previousRounds = coverage.rounds.map((r) => ({
+    round: r.round,
+    missionId: r.missionId,
+    objective: truncate(r.missionObjective, 200),
+    componentsTested: r.blueReport.componentsTested.map((ct) => ({
+      componentId: ct.componentId,
+      wasInvoked: ct.wasInvoked,
+      behaviorCorrect: ct.behaviorCorrect,
+      notes: truncate(ct.notes, 200),
+    })),
+    issuesFound: r.blueReport.issuesFound.map((i) => ({
+      severity: i.severity,
+      category: i.category,
+      description: truncate(i.description, 200),
+      rootCauseFile: i.rootCauseFile,
+    })),
+    fixesApplied: r.blueReport.fixesApplied.map((f) => ({
+      filePath: f.filePath,
+      description: truncate(f.description, 200),
+    })),
+    recommendations: r.blueReport.recommendations.map((rec) => ({
+      description: truncate(rec.description, 200),
+      priority: rec.priority,
+    })),
+  }));
 
-  return [
+  // User-priority components: those explicitly in the priority list with a positive score
+  const userPriorityList = componentsWithCoverage
+    .filter((c) => {
+      const p = priorityMap.get(c.id);
+      return p !== undefined && p > 0;
+    })
+    .sort((a, b) => b.priority - a.priority);
+
+  const sections: string[] = [
     `MODE: GENERATE_MISSION`,
     ``,
     `## Current State`,
@@ -53,24 +81,55 @@ function buildMissionPrompt(
     `\`\`\`json`,
     JSON.stringify(componentsWithCoverage, null, 2),
     `\`\`\``,
+  ];
+
+  // User-priority section
+  if (userPriorityList.length > 0 && userPriorityList.length < componentsWithCoverage.length) {
+    sections.push(
+      ``,
+      `## User-Priority Components`,
+      `The user explicitly selected these components for focused testing (highest priority first):`,
+    );
+    for (const c of userPriorityList) {
+      const status = c.covered ? "COVERED" : c.issueCount > 0 ? `ISSUES(${c.issueCount}), fixes(${c.fixCount})` : "UNTESTED";
+      sections.push(`- **${c.id}** — ${status}`);
+    }
+  }
+
+  // Previous rounds section
+  sections.push(
     ``,
-    `## Previous Missions (avoid repetition)`,
-    previousMissions.length > 0
-      ? `\`\`\`json\n${JSON.stringify(previousMissions, null, 2)}\n\`\`\``
-      : `None yet — this is the first round.`,
+    `## Previous Rounds`,
+  );
+  if (previousRounds.length > 0) {
+    sections.push(`\`\`\`json`, JSON.stringify(previousRounds, null, 2), `\`\`\``);
+  } else {
+    sections.push(`None yet — this is the first round.`);
+  }
+
+  // Instructions with depth-first strategy
+  sections.push(
     ``,
     `## Instructions`,
-    `Generate a Mission JSON targeting the highest-priority uncovered components.`,
+    `Generate a Mission JSON targeting components based on the following strategy:`,
     ``,
-    `## Component Priority`,
+    `### Depth-First Retesting Strategy`,
+    `1. **Re-validate fixed components** — If a user-priority component had issues in a previous round AND blue team applied fixes, re-target it to validate the fixes work.`,
+    `2. **Re-attack unfixed components** — If a user-priority component had issues that were NOT fixed (no fixesApplied for it), re-target it with a different angle of attack.`,
+    `3. **Only broaden when priority components are confirmed** — Only move on to new/lower-priority components when all user-priority components are \`covered: true\`.`,
+    `4. **Vary the attack angle** — When retesting a component, use a different persona and conversation approach than previous rounds. Review the previous round objectives and change your strategy.`,
+    ``,
+    `### Component Priority`,
     `Components have a numeric \`priority\` field (higher number = higher priority).`,
-    `After accounting for coverage status (untested > has-issues > covered),`,
-    `prefer higher-priority components.`,
+    `After applying the depth-first strategy above, prefer higher-priority components.`,
+    `Coverage status ranking: has-issues-with-fixes (revalidate) > has-issues-unfixed (retry) > untested > covered.`,
     ``,
     `Set the round field to ${round}.`,
     `Generate a UUID for missionId.`,
     `Keep estimatedTurns <= ${maxExchanges}.`,
-  ].join("\n");
+  );
+
+  return sections.join("\n");
 }
 
 export async function generateMission(
@@ -146,6 +205,9 @@ export async function generateMission(
       printWarning(`Mission generation error: ${err}`);
       debug(`mission: EXCEPTION — ${err} [${elapsed()}]`);
     }
+  } finally {
+    await missionQuery.return(undefined as never);
+    debug(`mission: query closed [${elapsed()}]`);
   }
 
   if (!mission) {

@@ -22,13 +22,15 @@ When given an inventory of components and coverage data, generate a focused test
 ## Rules for Mission Generation
 
 1. **One primary objective** — Each mission should have a clear, focused goal
-2. **Target uncovered components** — Prioritize components that haven't been tested yet
-3. **Creative personas** — Vary the user personas across rounds (technical user, non-technical, impatient, detail-oriented, confused, adversarial, etc.)
-4. **Avoid repetition** — Never repeat a mission objective or persona from previous rounds
-5. **Realistic scenarios** — The conversation should feel like a real user interaction
-6. **Edge cases matter** — Include specific edge cases to probe (ambiguous inputs, error conditions, boundary values)
-7. **Achievable scope** — The mission should be completable in the estimated number of turns
-8. **Exercise integrations** — When possible, design missions that trigger multiple components working together
+2. **Depth over breadth** — Prefer retesting components that had issues over spreading to new components. Re-validate fixed components and re-attack unfixed ones from different angles before moving on
+3. **Target uncovered components** — After user-priority components with issues are addressed, prioritize components that haven't been tested yet
+4. **Creative personas** — Vary the user personas across rounds (technical user, non-technical, impatient, detail-oriented, confused, adversarial, etc.)
+5. **Avoid repetition** — Never repeat a mission objective or persona from previous rounds. When retesting the same component, use a completely different attack angle
+6. **Realistic scenarios** — The conversation should feel like a real user interaction
+7. **Edge cases matter** — Include specific edge cases to probe (ambiguous inputs, error conditions, boundary values)
+8. **Achievable scope** — The mission should be completable in the estimated number of turns
+9. **Exercise integrations** — When possible, design missions that trigger multiple components working together
+10. **Learn from previous rounds** — Study the issues found, fixes applied, and recommendations from previous rounds. Design missions that specifically test whether past issues have been resolved
 
 ## How to Interpret Coverage Data
 

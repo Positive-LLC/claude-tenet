@@ -166,7 +166,7 @@ export async function runTenet(
     if (abortController.signal.aborted) break;
 
     // Update coverage
-    updateCoverage(coverage, blueReport, redResult, round);
+    updateCoverage(coverage, blueReport, redResult, round, mission.objective);
 
     // Print round report
     printRoundComplete(

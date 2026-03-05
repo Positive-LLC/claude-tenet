@@ -156,6 +156,7 @@ export interface CoverageStatus {
 export interface RoundSummary {
   round: number;
   missionId: string;
+  missionObjective: string;
   redResult: RedTeamResult;
   blueReport: BlueTeamReport;
   timestamp: string;

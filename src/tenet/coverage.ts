@@ -24,6 +24,7 @@ export function updateCoverage(
   blueReport: BlueTeamReport,
   redResult: RedTeamResult,
   round: number,
+  missionObjective: string,
 ): void {
   // Update component coverage from blue team report
   for (const ct of blueReport.componentsTested) {
@@ -86,6 +87,7 @@ export function updateCoverage(
   const summary: RoundSummary = {
     round,
     missionId: blueReport.missionId,
+    missionObjective,
     redResult,
     blueReport,
     timestamp: new Date().toISOString(),
