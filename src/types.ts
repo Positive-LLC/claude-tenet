@@ -21,6 +21,12 @@ export const DEFAULT_TYPE_PRIORITY: Record<ComponentType, number> = {
   mcp_server: 1,
 };
 
+export const FIX_GUIDANCE: Partial<Record<IssueCategory, string[]>> = {
+  missing_skill: [
+    "The SKILL.md frontmatter `description` field is what the agent uses to decide whether to load a skill. If a skill was not invoked, the fix should target this `description` — make it clearly match the user intent/keywords that should trigger it. Do NOT fix the body of the SKILL.md or other files as the primary fix; the body is only seen after the skill is already loaded.",
+  ],
+};
+
 export const MIN_OK_GUIDANCE: Partial<Record<ComponentType, string>> = {
   mcp_server:
     "As long as the MCP server was invoked and returned a result without error, " +

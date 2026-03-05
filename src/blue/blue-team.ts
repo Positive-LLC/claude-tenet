@@ -7,7 +7,7 @@ import type {
   PluginConfig,
   RedTeamResult,
 } from "../types.ts";
-import { BLUE_TEAM_REPORT_SCHEMA, MIN_OK_GUIDANCE } from "../types.ts";
+import { BLUE_TEAM_REPORT_SCHEMA, FIX_GUIDANCE, MIN_OK_GUIDANCE } from "../types.ts";
 import { extractSessionId, readSessionJSONL } from "./session-reader.ts";
 import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { resolve } from "https://deno.land/std@0.224.0/path/mod.ts";
@@ -45,6 +45,26 @@ function buildGuidanceSection(
   ];
 }
 
+function buildFixGuidanceSection(): string[] {
+  const entries = Object.entries(FIX_GUIDANCE) as [string, string[]][];
+  if (entries.length === 0) return [];
+
+  const lines: string[] = [
+    `## Fix Guidance`,
+    ``,
+    `When applying fixes, follow these rules:`,
+    ``,
+  ];
+  for (const [category, bullets] of entries) {
+    lines.push(`### ${category}`);
+    for (const bullet of bullets) {
+      lines.push(`- ${bullet}`);
+    }
+    lines.push(``);
+  }
+  return lines;
+}
+
 function buildBlueTeamPrompt(
   rawJSONL: string,
   sessionId: string,
@@ -70,6 +90,7 @@ function buildBlueTeamPrompt(
     ),
     ``,
     ...buildGuidanceSection(inventory, mission),
+    ...buildFixGuidanceSection(),
     `## Raw Session Data`,
     ``,
     `Below is the raw JSONL from the red team session. Parse it to understand what happened — each line is a JSON object representing a message. Refer to the JSONL Format Reference in your system prompt for the schema.`,
