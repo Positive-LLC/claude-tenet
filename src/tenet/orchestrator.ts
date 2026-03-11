@@ -88,9 +88,11 @@ export async function runTenet(
     if (abortController.signal.aborted) break;
 
     // Check if full coverage already achieved
-    const stats = getCoverageStats(coverage);
+    const scopeIds = userSelectedSet.size > 0 ? userSelectedSet : undefined;
+    const stats = getCoverageStats(coverage, scopeIds);
     if (stats.covered === stats.total && stats.total > 0 && round > 1) {
-      console.log("  Full coverage achieved! Stopping early.\n");
+      const scope = scopeIds ? "Selected components" : "Full coverage";
+      console.log(`  ${scope} — all pass! Stopping early.\n`);
       break;
     }
 

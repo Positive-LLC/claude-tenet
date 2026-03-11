@@ -66,6 +66,9 @@ export interface Mission {
   edgeCasesToProbe: string[];
   successCriteria: string[];
   estimatedTurns: number;
+  testMode?: TestMode;
+  setupType?: SetupType;
+  systemPromptComponentId?: string;
 }
 
 // ─── Red Team ───────────────────────────────────────────────────────────────
@@ -162,9 +165,34 @@ export interface RoundSummary {
   timestamp: string;
 }
 
+// ─── Test Mode ──────────────────────────────────────────────────────────────
+
+export type TestMode = "integration" | "unit";
+export type SetupType = "complete" | "focus";
+
+export interface UnitTestPlan {
+  targetComponent: string;
+  setupType: SetupType;
+  systemPromptSource: string; // component ID whose .md is the systemPrompt
+  componentsToCopy: string[]; // component IDs to include in sandbox
+  sandboxPath?: string; // set at runtime
+}
+
+export interface OwnershipAssignment {
+  componentId: string;
+  ownerComponentId: string;
+  componentsToCopy: string[];
+  reasoning: string;
+}
+
+export interface OwnershipResult {
+  assignments: OwnershipAssignment[];
+}
+
 // ─── CLI Config ─────────────────────────────────────────────────────────────
 
 export interface TenetConfig {
+  testMode: TestMode;
   rounds: number;
   maxExchanges: number;
   targetPath: string;
@@ -287,5 +315,30 @@ export const BLUE_TEAM_REPORT_SCHEMA = {
     "sessionId", "missionId", "conversationSummary",
     "componentsTested", "issuesFound", "fixesApplied", "recommendations",
   ],
+  additionalProperties: false,
+};
+
+export const OWNERSHIP_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    assignments: {
+      type: "array" as const,
+      items: {
+        type: "object" as const,
+        properties: {
+          componentId: { type: "string" as const },
+          ownerComponentId: { type: "string" as const },
+          componentsToCopy: {
+            type: "array" as const,
+            items: { type: "string" as const },
+          },
+          reasoning: { type: "string" as const },
+        },
+        required: ["componentId", "ownerComponentId", "componentsToCopy", "reasoning"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["assignments"],
   additionalProperties: false,
 };

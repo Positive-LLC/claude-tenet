@@ -1,13 +1,18 @@
 import { parseArgs } from "https://deno.land/std@0.224.0/cli/parse_args.ts";
-import type { TenetConfig } from "./types.ts";
+import type { TenetConfig, TestMode } from "./types.ts";
 import { runTenet } from "./tenet/orchestrator.ts";
+import { runUnitTenet } from "./tenet/unit-orchestrator.ts";
 import { printBanner } from "./utils/logger.ts";
 
 function printUsage(): void {
   console.log(`
-Usage: tenet [options]
+Usage: tenet <command> [options]
 
 Adversarial testing framework for markdown-based Claude agent projects.
+
+Commands:
+  integration    Integration test — does the parent agent call components smoothly?
+  unit           Unit test — does each component handle diverse scenarios correctly?
 
 Options:
   -r, --rounds <n>          Number of competition rounds (default: 3)
@@ -16,6 +21,11 @@ Options:
   -v, --verbose             Show full session transcripts in output
       --dry-run             Scan and generate first mission only, don't execute
       --help                Print usage
+
+Examples:
+  tenet integration -t ./my-project -r 5
+  tenet unit -t ./my-project -r 3 -e 5
+  tenet -t ./my-project                    # defaults to integration
 `);
 }
 
@@ -36,6 +46,20 @@ function parseConfig(): TenetConfig {
     Deno.exit(0);
   }
 
+  // Parse subcommand from positional args
+  const positional = args._ as string[];
+  let testMode: TestMode = "integration";
+  if (positional.length > 0) {
+    const cmd = String(positional[0]);
+    if (cmd === "unit" || cmd === "integration") {
+      testMode = cmd;
+    } else {
+      console.error(`Error: unknown command "${cmd}". Use "integration" or "unit".`);
+      printUsage();
+      Deno.exit(1);
+    }
+  }
+
   const rounds = parseInt(String(args.rounds || "3"), 10);
   const maxExchanges = parseInt(
     String(args["max-exchanges"] || "3"),
@@ -54,7 +78,7 @@ function parseConfig(): TenetConfig {
     Deno.exit(1);
   }
 
-  return { rounds, maxExchanges, targetPath, verbose, dryRun };
+  return { testMode, rounds, maxExchanges, targetPath, verbose, dryRun };
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -70,7 +94,11 @@ printBanner();
 const config = parseConfig();
 
 try {
-  await runTenet(config, abortController);
+  if (config.testMode === "unit") {
+    await runUnitTenet(config, abortController);
+  } else {
+    await runTenet(config, abortController);
+  }
 } catch (error) {
   if (abortController.signal.aborted) {
     console.log("  Aborted by user.");

@@ -4,9 +4,15 @@
 
 Markdown-based Claude agent projects (CLAUDE.md, skills, commands, agents, hooks) have no traditional test suite. There's no way to systematically verify that an agent behaves correctly across its full feature set. **claude-tenet** solves this by running adversarial simulations — a red team "user" pushes the agent to its limits, then a blue team analyst reads the session transcript, identifies issues, and fixes them. An orchestrator ("tenet") drives this loop across multiple rounds until coverage is achieved. Inspired by the movie Tenet (forward/backward) and Monte Carlo simulation (run many trials, find patterns).
 
+Tenet supports two test modes:
+- **Integration test** (`tenet integration`): Tests whether the parent agent calls each component smoothly in an end-to-end session.
+- **Unit test** (`tenet unit`): Isolates each component in a sandbox and pressure-tests it with edge cases, adversarial inputs, and boundary conditions.
+
 ---
 
 ## 1. Architecture Overview
+
+### Integration Test Flow
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -33,7 +39,29 @@ Blue Team (1 SDK query() call):
   Reads session JSONL + project files → fixes issues → outputs BlueTeamReport JSON
 ```
 
-### Execution Flow Per Round
+### Unit Test Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   TENET (Unit Orchestrator)                   │
+│                                                             │
+│  1. Scan project → build Inventory                          │
+│  2. LLM Ownership Analysis → determine component owners     │
+│  3. Build UnitTestPlan per component                        │
+│  4. For each component:                                     │
+│     a. Create sandbox (sibling dir)                         │
+│     b. Populate sandbox (complete or focus setup)           │
+│     c. For each round:                                      │
+│        - Generate unit mission (deep behavioral testing)    │
+│        - Red Team against sandbox (custom systemPrompt)     │
+│        - Blue Team analyzes + fixes in sandbox              │
+│        - Sync fixes back to original project                │
+│     d. Cleanup sandbox                                      │
+│  5. Final report                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Integration Execution Flow Per Round
 
 1. **Tenet** scans the target project, builds/updates `Inventory`
 2. **Tenet** generates a `Mission` targeting uncovered components
@@ -43,6 +71,14 @@ Blue Team (1 SDK query() call):
 6. **Tenet** updates coverage map, prints round report to stdout
 7. If rounds remain and coverage incomplete → next round
 
+### Unit Execution Flow
+
+1. **Tenet** scans project → `Inventory`
+2. **LLM Ownership Analysis** — a dedicated SDK call determines which agent owns each tool component and what dependencies it needs
+3. **Build UnitTestPlans** — one plan per component with setup type (complete/focus), system prompt source, and components to copy
+4. **Per component**: create isolated sandbox → run N rounds of mission generation + red team + blue team → sync fixes → cleanup sandbox
+5. MCP servers are skipped (cannot be unit tested in isolation)
+
 ---
 
 ## 2. CLI Interface
@@ -50,11 +86,15 @@ Blue Team (1 SDK query() call):
 Single binary compiled via `deno compile`. User runs from their project directory.
 
 ```
-tenet [options]
+tenet <command> [options]
+
+Commands:
+  integration    Integration test — does the parent agent call components smoothly? (default)
+  unit           Unit test — does each component handle diverse scenarios correctly?
 
 Options:
   -r, --rounds <n>          Number of competition rounds (default: 3)
-  -e, --max-exchanges <n>   Max conversation turns per red team session (default: 15)
+  -e, --max-exchanges <n>   Max conversation turns per red team session (default: 3)
   -t, --target <path>       Target project path (default: cwd)
   -v, --verbose             Show full session transcripts in output
       --dry-run             Scan and generate first mission only, don't execute
@@ -75,14 +115,18 @@ claude-tenet/
 ├── SPEC.md                    ← this file
 │
 ├── src/
-│   ├── main.ts                -- CLI entry, arg parsing, signal handling
+│   ├── main.ts                -- CLI entry, subcommand parsing, signal handling
 │   ├── types.ts               -- All shared TypeScript interfaces
+│   ├── prompts.ts             -- Load prompt files at module init
 │   │
 │   ├── tenet/
-│   │   ├── orchestrator.ts    -- Main loop: scan → mission → red → blue → report
+│   │   ├── orchestrator.ts    -- Integration test loop: scan → mission → red → blue → report
+│   │   ├── unit-orchestrator.ts -- Unit test loop: scan → ownership → sandbox → rounds → sync
 │   │   ├── scanner.ts         -- Filesystem scan → Inventory (no LLM needed)
 │   │   ├── mission.ts         -- Generate Mission from coverage gaps (uses SDK)
-│   │   └── coverage.ts        -- Track what's been tested across rounds
+│   │   ├── coverage.ts        -- Track what's been tested across rounds
+│   │   ├── sandbox.ts         -- Sandbox lifecycle: create, populate, cleanup, sync fixes
+│   │   └── ownership.ts       -- LLM ownership analysis + UnitTestPlan builder
 │   │
 │   ├── red/
 │   │   └── red-team.ts        -- Dual-SDK conversation loop (Attacker ↔ Target)
@@ -93,12 +137,16 @@ claude-tenet/
 │   │
 │   └── utils/
 │       ├── logger.ts          -- Structured stdout reporting
+│       ├── multiselect.ts     -- Interactive component selection
+│       ├── claude-path.ts     -- Claude executable path resolution
 │       └── session-path.ts    -- Session file path helpers
 │
 └── prompts/
     ├── tenet.md               -- Orchestrator system prompt
     ├── red-team.md            -- Attacker system prompt
-    └── blue-team.md           -- Blue team debugger system prompt
+    ├── blue-team.md           -- Blue team debugger system prompt
+    ├── ownership.md           -- Ownership analyzer system prompt
+    └── unit-test.md           -- Unit test mission generator system prompt
 ```
 
 ---
@@ -148,6 +196,39 @@ interface Mission {
   edgeCasesToProbe: string[];       // specific failure modes to attempt
   successCriteria: string[];        // what counts as tested
   estimatedTurns: number;
+  testMode?: TestMode;              // "integration" | "unit" (set for unit missions)
+  setupType?: SetupType;            // "complete" | "focus" (unit test sandbox setup)
+  systemPromptComponentId?: string; // component ID used as systemPrompt source
+}
+
+type TestMode = "integration" | "unit";
+type SetupType = "complete" | "focus";
+```
+
+### 4.6 UnitTestPlan (produced by ownership analysis)
+
+```typescript
+interface UnitTestPlan {
+  targetComponent: string;          // component ID to test
+  setupType: SetupType;             // "complete" for CLAUDE.md, "focus" for tools
+  systemPromptSource: string;       // component ID whose .md is the systemPrompt
+  componentsToCopy: string[];       // component IDs to include in sandbox
+  sandboxPath?: string;             // set at runtime
+}
+```
+
+### 4.7 OwnershipResult (produced by LLM ownership analysis)
+
+```typescript
+interface OwnershipResult {
+  assignments: OwnershipAssignment[];
+}
+
+interface OwnershipAssignment {
+  componentId: string;
+  ownerComponentId: string;         // which claude_md or agent owns this component
+  componentsToCopy: string[];       // IDs of dependent components to include
+  reasoning: string;
 }
 ```
 
@@ -330,6 +411,7 @@ async function runRedTeam(mission: Mission, targetPath: string, maxExchanges: nu
 **Key design decisions:**
 - Attacker gets **zero tools** — purely conversational, simulates a real user
 - Target Agent gets **full Claude Code preset** with project settings loaded — behaves exactly like a real session
+- In unit test mode, the target can receive a **custom systemPrompt** (e.g., a sub-agent's .md) instead of the `claude_code` preset
 - Attacker only sees the **text portion** of Target's responses (not tool use details)
 - `persistSession: false` on Attacker (ephemeral), `true` on Target (session JSONL is the artifact)
 - Both use `bypassPermissions` for unattended execution
@@ -439,7 +521,7 @@ const missionQuery = query({
 
 Input to mission generation: current inventory with coverage status + previous missions (to avoid repetition).
 
-### Main Loop (`src/tenet/orchestrator.ts`)
+### Integration Loop (`src/tenet/orchestrator.ts`)
 
 ```
 for round 1..N:
@@ -451,6 +533,50 @@ for round 1..N:
   6. updateCoverage(coverage, blueReport, round)
   7. print(roundCompleteReport)                  // stdout after EVERY round
 ```
+
+### Unit Test Loop (`src/tenet/unit-orchestrator.ts`)
+
+```
+1. inventory = scan(targetPath)
+2. ownershipResult = analyzeOwnership(inventory)     // dedicated SDK call
+3. plans = buildUnitTestPlans(inventory, ownershipResult)
+4. for each plan (prioritized):
+   a. sandbox = createSandbox(targetPath)
+   b. populateSandbox(sandbox, plan)                 // complete or focus setup
+   c. for round 1..N:
+      - mission = generateUnitMission(plan, ...)     // SDK call, deep behavioral testing
+      - redResult = runRedTeam(mission, sandbox, customSystemPrompt)
+      - blueReport = runBlueTeam(redResult, mission, sandbox)
+      - syncFixesBack(sandbox, targetPath, fixes)
+      - updateCoverage(coverage, blueReport, round)
+   d. cleanupSandbox(sandbox)
+5. print(finalSummary)
+```
+
+### Sandbox (`src/tenet/sandbox.ts`)
+
+All filesystem ops, no LLM. Creates a sibling folder next to the target project (`{parent}/.tenet-sandbox-{timestamp}/`).
+
+- **Complete setup** (for CLAUDE.md): copies entire project structure (excluding .git, node_modules)
+- **Focus setup** (for agents/tools): copies only listed components, preserving directory structure, plus .claude/settings.json
+
+Fixes applied by blue team in the sandbox are synced back to the original project via `syncFixesBack()`.
+
+### Ownership Analysis (`src/tenet/ownership.ts`)
+
+A dedicated pre-processing SDK call that runs once before unit test rounds. Determines which agent owns each tool component.
+
+- **Prompt**: Full content of all components, formatted for analysis
+- **System prompt**: `prompts/ownership.md`
+- **SDK options**: `tools: []`, structured output with `OWNERSHIP_SCHEMA`
+- **Output**: `OwnershipResult` mapping each tool to its owner agent + dependencies
+- **Fallback**: If SDK call fails, all tools default to CLAUDE.md ownership
+
+Plan building rules:
+- `claude_md` → complete setup, systemPrompt = self, copy all
+- `agent` → focus setup, systemPrompt = self, copy all tools
+- `skill/command/hook/knowledge/other_md` → focus setup, systemPrompt = owner from LLM, copy self + LLM-determined dependencies
+- `mcp_server` → skip (no unit test)
 
 ### Coverage Tracking (`src/tenet/coverage.ts`)
 
@@ -513,6 +639,41 @@ After each blue team report:
 - Project path
 
 **Output**: BlueTeamReport JSON (structured output)
+
+In unit test mode, the blue team instructions are stricter: `behaviorCorrect=true` requires the component to handle ALL test scenarios correctly (including edge cases), not just be invoked.
+
+### 8.4 `prompts/ownership.md` — Ownership Analyzer
+
+**Role**: You analyze relationships between components in a Claude agent project to determine ownership.
+
+**Static content**:
+- How to determine ownership: explicit references, semantic domain, workflow context, default to CLAUDE.md
+- How to determine dependencies: co-used components, referenced components, shared workflows
+- Only produces assignments for tool-like components (skill, command, hook, knowledge, other_md)
+- Skips MCP servers
+
+**Dynamic context** (via prompt parameter):
+- Full file content of every component (capped at 3000 chars each)
+- List of all component IDs
+
+**Output**: OwnershipResult JSON (structured output)
+
+### 8.5 `prompts/unit-test.md` — Unit Test Mission Generator
+
+**Role**: You generate missions for deep behavioral testing of individual components.
+
+**Static content**:
+- Depth over breadth: test ONE component thoroughly
+- Edge cases & traps: ambiguous inputs, boundary conditions, adversarial inputs
+- Behavioral correctness: component must produce correct output, follow its instructions
+- Persona design: demanding, detail-oriented user who follows up
+
+**Dynamic context** (via prompt parameter):
+- Full content of the target component
+- Coverage status, setup type, system prompt source
+- Components in the sandbox
+
+**Output**: Mission JSON (structured output) with exactly one targetComponent
 
 ---
 
@@ -607,7 +768,7 @@ target-project/
 
 ### Phase 1: Foundation
 1. `src/types.ts` — all interfaces and types
-2. `src/main.ts` — CLI skeleton with arg parsing and signal handling
+2. `src/main.ts` — CLI skeleton with subcommand parsing and signal handling
 3. `src/tenet/scanner.ts` — filesystem scan → Inventory
 4. `src/utils/logger.ts` — stdout reporting functions
 5. `src/utils/session-path.ts` — session file path helpers
@@ -616,23 +777,31 @@ target-project/
 6. `prompts/tenet.md` — orchestrator system prompt
 7. `prompts/red-team.md` — attacker system prompt
 8. `prompts/blue-team.md` — blue team system prompt
+9. `prompts/ownership.md` — ownership analyzer system prompt
+10. `prompts/unit-test.md` — unit test mission generator system prompt
 
 ### Phase 3: Red Team
-9. `src/red/red-team.ts` — dual-SDK conversation relay loop
+11. `src/red/red-team.ts` — dual-SDK conversation relay loop (with optional custom systemPrompt)
 
 ### Phase 4: Blue Team
-10. `src/blue/session-reader.ts` — JSONL parser
-11. `src/blue/blue-team.ts` — blue team SDK invocation with structured output
+12. `src/blue/session-reader.ts` — JSONL parser
+13. `src/blue/blue-team.ts` — blue team SDK invocation (stricter evaluation in unit mode)
 
-### Phase 5: Orchestration
-12. `src/tenet/mission.ts` — mission generation via SDK
-13. `src/tenet/coverage.ts` — coverage tracking logic
-14. `src/tenet/orchestrator.ts` — main loop tying everything together
+### Phase 5: Integration Orchestration
+14. `src/tenet/mission.ts` — mission generation via SDK
+15. `src/tenet/coverage.ts` — coverage tracking logic
+16. `src/tenet/orchestrator.ts` — integration test loop
 
-### Phase 6: Polish
-15. Error handling, graceful shutdown, edge cases
-16. `deno compile` configuration and binary output
-17. End-to-end test against `pg-logistics-agency`
+### Phase 6: Unit Test Capability
+17. `src/tenet/sandbox.ts` — sandbox lifecycle (create, populate, cleanup, sync)
+18. `src/tenet/ownership.ts` — LLM ownership analysis + UnitTestPlan builder
+19. `src/tenet/mission.ts` — unit mission generation (`generateUnitMission`)
+20. `src/tenet/unit-orchestrator.ts` — unit test loop
+
+### Phase 7: Polish
+21. Error handling, graceful shutdown, edge cases
+22. `deno compile` configuration and binary output
+23. End-to-end tests
 
 ---
 
@@ -641,5 +810,9 @@ target-project/
 1. **Unit**: Scanner correctly identifies all component types from a sample project
 2. **Integration**: Red team dual-SDK loop completes a 3-turn conversation
 3. **Integration**: Blue team produces valid BlueTeamReport JSON from a real session file
-4. **E2E**: Full `tenet --rounds 1 --target ../pg-logistics-agency` completes successfully
-5. **E2E**: Multi-round (`--rounds 3`) shows coverage increasing across rounds
+4. **E2E**: `tenet integration --rounds 1 --target ../pg-logistics-agency` completes successfully
+5. **E2E**: Multi-round integration (`--rounds 3`) shows coverage increasing across rounds
+6. **E2E**: `tenet unit --target ../pg-logistics-agency` creates sandbox per component, runs focused pressure tests, syncs fixes, cleans up
+7. **Ownership**: Dedicated ownership SDK call produces sensible agent-tool assignments
+8. **Sandbox**: Sandbox is created next to target and cleaned up after each component
+9. **MCP skip**: MCP components are skipped in unit test mode

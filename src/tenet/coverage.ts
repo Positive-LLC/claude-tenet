@@ -97,11 +97,13 @@ export function updateCoverage(
 
 export function getCoverageStats(
   coverage: CoverageState,
+  scopeIds?: Set<string>,
 ): { total: number; covered: number; percentage: number } {
-  const total = Object.keys(coverage.components).length;
-  const covered = Object.values(coverage.components).filter(
-    (c) => c.covered,
-  ).length;
+  const entries = scopeIds
+    ? Object.entries(coverage.components).filter(([id]) => scopeIds.has(id))
+    : Object.entries(coverage.components);
+  const total = entries.length;
+  const covered = entries.filter(([, c]) => c.covered).length;
   const percentage = total > 0 ? Math.round((covered / total) * 100) : 0;
   return { total, covered, percentage };
 }

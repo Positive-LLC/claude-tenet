@@ -137,6 +137,7 @@ export async function runRedTeam(
   maxExchanges: number,
   abortController: AbortController,
   plugins: PluginConfig[] = [],
+  customSystemPrompt?: string,
 ): Promise<RedTeamResult> {
   const startTime = Date.now();
   let totalCostUsd = 0;
@@ -162,13 +163,16 @@ export async function runRedTeam(
     maxTurns: 1,
   };
 
-  // Target base options (full Claude Code)
+  // Target base options (full Claude Code, or custom systemPrompt for unit tests)
+  const targetSystemPrompt = customSystemPrompt
+    ? customSystemPrompt
+    : { type: "preset" as const, preset: "claude_code" as const };
   const targetBaseOpts = {
     model: "claude-opus-4-6",
     pathToClaudeCodeExecutable: claudePath,
     env: cleanEnv,
     cwd: resolvedTargetPath,
-    systemPrompt: { type: "preset", preset: "claude_code" } as const,
+    systemPrompt: targetSystemPrompt,
     settingSources: ["project"] as string[],
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,

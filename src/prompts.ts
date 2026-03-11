@@ -20,4 +20,6 @@ export const PROMPTS = {
   tenet: loadSync("tenet.md"),
   redTeam: loadSync("red-team.md"),
   blueTeam: loadSync("blue-team.md"),
+  ownership: loadSync("ownership.md"),
+  unitTest: loadSync("unit-test.md"),
 } as const;

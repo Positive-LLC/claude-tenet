@@ -1,9 +1,10 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { CoverageState, Inventory, Mission } from "../types.ts";
+import type { CoverageState, Inventory, Mission, UnitTestPlan } from "../types.ts";
 import { MISSION_SCHEMA } from "../types.ts";
 import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { PROMPTS } from "../prompts.ts";
 import { getClaudePath } from "../utils/claude-path.ts";
+import { resolve, join } from "https://deno.land/std@0.224.0/path/mod.ts";
 
 /** Truncate a string to maxLen, appending "…" if truncated. */
 function truncate(s: string, maxLen: number): string {
@@ -237,6 +238,202 @@ export async function generateMission(
       estimatedTurns: Math.min(maxExchanges, 10),
     };
   }
+
+  return mission;
+}
+
+// ─── Unit Test Mission Generation ───────────────────────────────────────────
+
+function buildUnitMissionPrompt(
+  plan: UnitTestPlan,
+  inventory: Inventory,
+  coverage: CoverageState,
+  round: number,
+  totalRounds: number,
+  maxExchanges: number,
+  targetPath: string,
+): string {
+  const absTarget = resolve(targetPath);
+  const comp = inventory.components.find((c) => c.id === plan.targetComponent);
+
+  // Read full file content of target component
+  let fullContent = "(could not read file)";
+  if (comp) {
+    try {
+      const filePath = comp.filePath.startsWith("/")
+        ? comp.filePath
+        : join(absTarget, comp.filePath);
+      const stat = Deno.statSync(filePath);
+      if (stat.isDirectory) {
+        // For skill directories, read SKILL.md or first .md
+        try {
+          fullContent = Deno.readTextFileSync(join(filePath, "SKILL.md"));
+        } catch {
+          for (const entry of Deno.readDirSync(filePath)) {
+            if (entry.name.endsWith(".md")) {
+              fullContent = Deno.readTextFileSync(join(filePath, entry.name));
+              break;
+            }
+          }
+        }
+      } else {
+        fullContent = Deno.readTextFileSync(filePath);
+      }
+    } catch {
+      fullContent = comp.description;
+    }
+  }
+
+  const status = coverage.components[plan.targetComponent];
+  const coverageInfo = status
+    ? `covered=${status.covered}, issues=${status.issueCount}, fixes=${status.fixCount}`
+    : "untested";
+
+  const sections: string[] = [
+    `MODE: GENERATE_UNIT_MISSION`,
+    ``,
+    `## Target Component`,
+    `- ID: ${plan.targetComponent}`,
+    `- Type: ${comp?.type || "unknown"}`,
+    `- File: ${comp?.filePath || "unknown"}`,
+    `- Coverage: ${coverageInfo}`,
+    `- Setup Type: ${plan.setupType}`,
+    `- System Prompt Source: ${plan.systemPromptSource}`,
+    ``,
+    `## Full Component Content`,
+    `\`\`\``,
+    fullContent,
+    `\`\`\``,
+    ``,
+    `## Test Environment`,
+    `Sandbox contains these components:`,
+    ...plan.componentsToCopy.map((id) => {
+      const c = inventory.components.find((x) => x.id === id);
+      return `- ${id} (${c?.type || "?"}) — ${c?.filePath || "?"}`;
+    }),
+    ``,
+    `## State`,
+    `Round: ${round} of ${totalRounds}`,
+    `Max conversation turns: ${maxExchanges}`,
+    ``,
+    `## Instructions`,
+    `Generate a Mission JSON that deeply tests this single component.`,
+    `The targetComponents array must contain exactly: ["${plan.targetComponent}"]`,
+    `Set round to ${round}.`,
+    `Generate a UUID for missionId.`,
+    `Set estimatedTurns to ${maxExchanges} (use the full budget for thorough testing).`,
+    `Design conversation starters that each test a different aspect of the component.`,
+    `Include edge cases: boundary inputs, ambiguous requests, error conditions, adversarial inputs.`,
+  ];
+
+  return sections.join("\n");
+}
+
+export async function generateUnitMission(
+  plan: UnitTestPlan,
+  inventory: Inventory,
+  coverage: CoverageState,
+  round: number,
+  totalRounds: number,
+  maxExchanges: number,
+  abortController: AbortController,
+  targetPath: string,
+): Promise<Mission> {
+  const claudePath = getClaudePath();
+  const prompt = buildUnitMissionPrompt(
+    plan,
+    inventory,
+    coverage,
+    round,
+    totalRounds,
+    maxExchanges,
+    targetPath,
+  );
+
+  const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
+
+  debug(`unit-mission: starting SDK call — prompt ${prompt.length} chars`);
+  const elapsed = startTimer();
+
+  const missionQuery = query({
+    prompt,
+    options: {
+      model: "claude-opus-4-6",
+      pathToClaudeCodeExecutable: claudePath,
+      env: cleanEnv,
+      systemPrompt: PROMPTS.unitTest,
+      tools: [],
+      outputFormat: { type: "json_schema", schema: MISSION_SCHEMA },
+      persistSession: false,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      maxTurns: 5,
+      abortController,
+    },
+  });
+
+  let mission: Mission | null = null;
+
+  try {
+    let msgCount = 0;
+    for await (const msg of missionQuery) {
+      msgCount++;
+      if (abortController.signal.aborted) break;
+
+      const subtype = "subtype" in msg ? `:${msg.subtype}` : "";
+      debug(`unit-mission: msg #${msgCount} type=${msg.type}${subtype} [${elapsed()}]`);
+
+      if (msg.type === "result") {
+        if (msg.subtype === "success" && msg.structured_output) {
+          mission = msg.structured_output as Mission;
+          debug(`unit-mission: objective: "${mission.objective.slice(0, 80)}..." [${elapsed()}]`);
+        } else if (msg.subtype !== "success") {
+          printWarning(`Unit mission generation ended with: ${msg.subtype}`);
+        }
+        break;
+      }
+    }
+    debug(`unit-mission: stream ended — ${msgCount} messages [${elapsed()}]`);
+  } catch (err) {
+    if (!abortController.signal.aborted) {
+      printWarning(`Unit mission generation error: ${err}`);
+      debug(`unit-mission: EXCEPTION — ${err} [${elapsed()}]`);
+    }
+  } finally {
+    await missionQuery.return(undefined as never);
+    debug(`unit-mission: query closed [${elapsed()}]`);
+  }
+
+  if (!mission) {
+    debug(`unit-mission: using fallback`);
+    mission = {
+      missionId: crypto.randomUUID(),
+      round,
+      objective: `Thoroughly test component ${plan.targetComponent} with edge cases and adversarial inputs`,
+      targetComponents: [plan.targetComponent],
+      persona: "A demanding, detail-oriented user who notices subtle errors",
+      conversationStarters: [
+        "I need to test this specific functionality thoroughly.",
+        "Let me try some edge cases.",
+      ],
+      edgeCasesToProbe: [
+        "Empty or missing inputs",
+        "Very long inputs",
+        "Special characters and unicode",
+        "Conflicting instructions",
+      ],
+      successCriteria: [
+        `Component ${plan.targetComponent} handles all scenarios correctly`,
+        `Error messages are helpful and accurate`,
+      ],
+      estimatedTurns: maxExchanges,
+    };
+  }
+
+  // Tag with unit test metadata
+  mission.testMode = "unit";
+  mission.setupType = plan.setupType;
+  mission.systemPromptComponentId = plan.systemPromptSource;
 
   return mission;
 }
