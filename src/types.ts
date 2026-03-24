@@ -95,6 +95,8 @@ export interface BlueTeamReport {
   };
   componentsTested: ComponentTestResult[];
   issuesFound: Issue[];
+  proposedFixes: ProposedFix[];
+  /** @deprecated use proposedFixes — kept for backward compat with unit mode */
   fixesApplied: Fix[];
   recommendations: Recommendation[];
 }
@@ -144,16 +146,23 @@ export interface Recommendation {
 
 // ─── Coverage ───────────────────────────────────────────────────────────────
 
+export type ComponentStatus = "untested" | "pass" | "proceed" | "fail";
+
 export interface CoverageState {
   components: Record<string, CoverageStatus>;
+  iterations: IterationSummary[];
+  /** @deprecated kept for backward compat with unit-orchestrator */
   rounds: RoundSummary[];
 }
 
 export interface CoverageStatus {
-  covered: boolean;
-  coveredInRound?: number;
+  status: ComponentStatus;
+  statusUpdatedInIteration?: number;
   issueCount: number;
   fixCount: number;
+  /** @deprecated use status instead */
+  covered: boolean;
+  coveredInRound?: number;
 }
 
 export interface RoundSummary {
@@ -163,6 +172,39 @@ export interface RoundSummary {
   redResult: RedTeamResult;
   blueReport: BlueTeamReport;
   timestamp: string;
+}
+
+export interface IterationSummary {
+  iteration: number;
+  taskResults: TaskResult[];
+  fixesAppliedCount: number;
+  timestamp: string;
+}
+
+// ─── Task / Worker ──────────────────────────────────────────────────────────
+
+export interface Task {
+  taskId: string;
+  mission: Mission;
+  workerId: number;
+}
+
+export interface TaskResult {
+  taskId: string;
+  workerId: number;
+  redResult?: RedTeamResult;
+  blueReport?: BlueTeamReport;
+}
+
+// ─── Proposed Fix ───────────────────────────────────────────────────────────
+
+export interface ProposedFix {
+  fixId: string;
+  issueId: string;
+  targetFilePath: string;
+  description: string;
+  suggestedChange: string;
+  priority: Severity;
 }
 
 // ─── Test Mode ──────────────────────────────────────────────────────────────
@@ -198,6 +240,7 @@ export interface TenetConfig {
   targetPath: string;
   verbose: boolean;
   dryRun: boolean;
+  workers: number;
 }
 
 // ─── JSON Schemas (for SDK structured output) ───────────────────────────────
@@ -282,6 +325,22 @@ export const BLUE_TEAM_REPORT_SCHEMA = {
         additionalProperties: false,
       },
     },
+    proposedFixes: {
+      type: "array" as const,
+      items: {
+        type: "object" as const,
+        properties: {
+          fixId: { type: "string" as const },
+          issueId: { type: "string" as const },
+          targetFilePath: { type: "string" as const },
+          description: { type: "string" as const },
+          suggestedChange: { type: "string" as const },
+          priority: { type: "string" as const, enum: ["critical", "high", "medium", "low"] },
+        },
+        required: ["fixId", "issueId", "targetFilePath", "description", "suggestedChange", "priority"],
+        additionalProperties: false,
+      },
+    },
     fixesApplied: {
       type: "array" as const,
       items: {
@@ -313,7 +372,7 @@ export const BLUE_TEAM_REPORT_SCHEMA = {
   },
   required: [
     "sessionId", "missionId", "conversationSummary",
-    "componentsTested", "issuesFound", "fixesApplied", "recommendations",
+    "componentsTested", "issuesFound", "proposedFixes", "fixesApplied", "recommendations",
   ],
   additionalProperties: false,
 };
@@ -340,5 +399,42 @@ export const OWNERSHIP_SCHEMA = {
     },
   },
   required: ["assignments"],
+  additionalProperties: false,
+};
+
+// Schema for planIteration() — produces N missions + status updates
+export interface IterationPlan {
+  missions: Mission[];
+  statusUpdates: StatusUpdate[];
+}
+
+export interface StatusUpdate {
+  componentId: string;
+  newStatus: ComponentStatus;
+  reason: string;
+}
+
+export const ITERATION_PLAN_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    missions: {
+      type: "array" as const,
+      items: MISSION_SCHEMA,
+    },
+    statusUpdates: {
+      type: "array" as const,
+      items: {
+        type: "object" as const,
+        properties: {
+          componentId: { type: "string" as const },
+          newStatus: { type: "string" as const, enum: ["untested", "pass", "proceed", "fail"] },
+          reason: { type: "string" as const },
+        },
+        required: ["componentId", "newStatus", "reason"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["missions", "statusUpdates"],
   additionalProperties: false,
 };
