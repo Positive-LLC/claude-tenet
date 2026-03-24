@@ -52,7 +52,7 @@ function buildFixGuidanceSection(): string[] {
   const lines: string[] = [
     `## Fix Guidance`,
     ``,
-    `When applying fixes, follow these rules:`,
+    `When proposing fixes, follow these rules:`,
     ``,
   ];
   for (const [category, bullets] of entries) {
@@ -70,7 +70,41 @@ function buildBlueTeamPrompt(
   sessionId: string,
   mission: Mission,
   inventory: Inventory,
+  analysisOnly: boolean,
 ): string {
+  const analysisInstructions = analysisOnly
+    ? [
+        `1. Parse the raw JSONL session data above carefully`,
+        `2. For each target component (${mission.targetComponents.join(", ")}), determine if it was invoked and whether it behaved correctly`,
+        `3. Identify any issues in the agent's behavior (use the issue categories from your system prompt)`,
+        `4. Read the relevant project files using your tools to understand root causes`,
+        `5. For each issue, propose a fix in the proposedFixes array — describe what should change, but do NOT apply fixes`,
+        `6. Leave fixesApplied as an empty array`,
+        `7. Output a BlueTeamReport JSON object as your final structured output`,
+      ]
+    : (mission.testMode === "unit"
+      ? [
+          `**UNIT TEST MODE**: This session tested a single component in isolation.`,
+          `Evaluation must be STRICT — the component must handle ALL test scenarios correctly, not just be invoked.`,
+          ``,
+          `1. Parse the raw JSONL session data above carefully`,
+          `2. For the target component (${mission.targetComponents.join(", ")}), evaluate behavioral correctness across ALL conversation scenarios`,
+          `3. Mark behaviorCorrect=true ONLY if the component handled every scenario correctly (including edge cases, error conditions, and adversarial inputs)`,
+          `4. Mark behaviorCorrect=false if the component failed ANY scenario, even partially`,
+          `5. Document each failure scenario as a separate issue with specific evidence`,
+          `6. Read the relevant project files using your tools to understand root causes`,
+          `7. Apply minimal fixes to project files where appropriate`,
+          `8. Output a BlueTeamReport JSON object as your final structured output`,
+        ]
+      : [
+          `1. Parse the raw JSONL session data above carefully`,
+          `2. For each target component (${mission.targetComponents.join(", ")}), determine if it was invoked and whether it behaved correctly`,
+          `3. Identify any issues in the agent's behavior (use the issue categories from your system prompt)`,
+          `4. Read the relevant project files using your tools to understand root causes`,
+          `5. Apply minimal fixes to project files where appropriate`,
+          `6. Output a BlueTeamReport JSON object as your final structured output`,
+        ]);
+
   return [
     `# Blue Team Analysis Task`,
     ``,
@@ -101,28 +135,7 @@ function buildBlueTeamPrompt(
     ``,
     `## Instructions`,
     ``,
-    ...(mission.testMode === "unit"
-      ? [
-          `**UNIT TEST MODE**: This session tested a single component in isolation.`,
-          `Evaluation must be STRICT — the component must handle ALL test scenarios correctly, not just be invoked.`,
-          ``,
-          `1. Parse the raw JSONL session data above carefully`,
-          `2. For the target component (${mission.targetComponents.join(", ")}), evaluate behavioral correctness across ALL conversation scenarios`,
-          `3. Mark behaviorCorrect=true ONLY if the component handled every scenario correctly (including edge cases, error conditions, and adversarial inputs)`,
-          `4. Mark behaviorCorrect=false if the component failed ANY scenario, even partially`,
-          `5. Document each failure scenario as a separate issue with specific evidence`,
-          `6. Read the relevant project files using your tools to understand root causes`,
-          `7. Apply minimal fixes to project files where appropriate`,
-          `8. Output a BlueTeamReport JSON object as your final structured output`,
-        ]
-      : [
-          `1. Parse the raw JSONL session data above carefully`,
-          `2. For each target component (${mission.targetComponents.join(", ")}), determine if it was invoked and whether it behaved correctly`,
-          `3. Identify any issues in the agent's behavior (use the issue categories from your system prompt)`,
-          `4. Read the relevant project files using your tools to understand root causes`,
-          `5. Apply minimal fixes to project files where appropriate`,
-          `6. Output a BlueTeamReport JSON object as your final structured output`,
-        ]),
+    ...analysisInstructions,
     ``,
     `Remember: use session_id="${sessionId}" and mission_id="${mission.missionId}" in your report.`,
   ].join("\n");
@@ -143,11 +156,17 @@ function makeEmptyReport(
     },
     componentsTested: [],
     issuesFound: [],
+    proposedFixes: [],
     fixesApplied: [],
     recommendations: [],
   };
 }
 
+/**
+ * Run the blue team analysis.
+ * @param analysisOnly - When true, blue team has no tools and only proposes fixes (integration worker mode).
+ *                       When false, blue team has full tool access and may apply fixes (unit mode / legacy).
+ */
 export async function runBlueTeam(
   redResult: RedTeamResult,
   mission: Mission,
@@ -155,6 +174,7 @@ export async function runBlueTeam(
   targetPath: string,
   abortController: AbortController,
   plugins: PluginConfig[] = [],
+  analysisOnly = false,
 ): Promise<BlueTeamReport> {
   // If no session file, return empty report
   if (!redResult.sessionFilePath) {
@@ -180,8 +200,8 @@ export async function runBlueTeam(
 
   const blueTeamSystemPrompt = PROMPTS.blueTeam;
   const claudePath = getClaudePath();
-  const prompt = buildBlueTeamPrompt(rawJSONL, sessionId, mission, inventory);
-  debug(`blue-team: prompt built — ${prompt.length} chars`);
+  const prompt = buildBlueTeamPrompt(rawJSONL, sessionId, mission, inventory, analysisOnly);
+  debug(`blue-team: prompt built — ${prompt.length} chars, analysisOnly=${analysisOnly}`);
 
   // Build clean env without CLAUDECODE to allow nested sessions
   const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
@@ -189,21 +209,33 @@ export async function runBlueTeam(
   debug(`blue-team: starting SDK call — claudePath=${claudePath}, cwd=${resolve(targetPath)}`);
   const elapsed = startTimer();
 
+  // In analysis-only mode, restrict tools so blue team cannot modify project files
+  const sdkOptions: Record<string, unknown> = {
+    model: "claude-opus-4-6",
+    pathToClaudeCodeExecutable: claudePath,
+    env: cleanEnv,
+    cwd: resolve(targetPath),
+    systemPrompt: blueTeamSystemPrompt,
+    permissionMode: "bypassPermissions",
+    allowDangerouslySkipPermissions: true,
+    outputFormat: { type: "json_schema", schema: BLUE_TEAM_REPORT_SCHEMA },
+    abortController,
+  };
+
+  if (analysisOnly) {
+    // Read-only tools: can read files to understand root causes, but cannot write
+    sdkOptions.tools = ["Read", "Glob", "Grep"];
+    sdkOptions.maxTurns = 30;
+  } else {
+    sdkOptions.maxTurns = 50;
+    if (plugins.length > 0) {
+      sdkOptions.plugins = plugins;
+    }
+  }
+
   const blueQuery = query({
     prompt,
-    options: {
-      model: "claude-opus-4-6",
-      pathToClaudeCodeExecutable: claudePath,
-      env: cleanEnv,
-      cwd: resolve(targetPath),
-      systemPrompt: blueTeamSystemPrompt,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      outputFormat: { type: "json_schema", schema: BLUE_TEAM_REPORT_SCHEMA },
-      maxTurns: 50,
-      plugins: plugins.length > 0 ? plugins : undefined,
-      abortController,
-    },
+    options: sdkOptions as never,
   });
 
   let report: BlueTeamReport | null = null;
@@ -223,7 +255,10 @@ export async function runBlueTeam(
       if (msg.type === "result") {
         if (msg.subtype === "success" && msg.structured_output) {
           report = msg.structured_output as BlueTeamReport;
-          debug(`blue-team: got structured report — ${report.issuesFound.length} issues, ${report.fixesApplied.length} fixes [${elapsed()}]`);
+          // Ensure proposedFixes exists (backward compat with old schema)
+          if (!report.proposedFixes) report.proposedFixes = [];
+          if (!report.fixesApplied) report.fixesApplied = [];
+          debug(`blue-team: got structured report — ${report.issuesFound.length} issues, ${report.proposedFixes.length} proposed fixes [${elapsed()}]`);
         } else if (msg.subtype !== "success") {
           printWarning(`Blue team ended with: ${msg.subtype}`);
         }
