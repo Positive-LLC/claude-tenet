@@ -1,6 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { CoverageState, Inventory, Mission, UnitTestPlan } from "../types.ts";
-import { MISSION_SCHEMA } from "../types.ts";
+import type { CoverageState, Inventory, IterationPlan, Mission, UnitTestPlan } from "../types.ts";
+import { MISSION_SCHEMA, ITERATION_PLAN_SCHEMA } from "../types.ts";
 import { printWarning, debug, startTimer } from "../utils/logger.ts";
 import { PROMPTS } from "../prompts.ts";
 import { getClaudePath } from "../utils/claude-path.ts";
@@ -29,7 +29,7 @@ function buildMissionPrompt(
       name: c.name,
       filePath: c.filePath,
       description: c.description.slice(0, 150),
-      covered: status?.covered ?? false,
+      status: status?.status ?? "untested",
       issueCount: status?.issueCount ?? 0,
       fixCount: status?.fixCount ?? 0,
       priority: priorityMap.get(c.id) ?? 0,
@@ -53,7 +53,12 @@ function buildMissionPrompt(
       description: truncate(i.description, 200),
       rootCauseFile: i.rootCauseFile,
     })),
-    fixesApplied: r.blueReport.fixesApplied.map((f) => ({
+    proposedFixes: (r.blueReport.proposedFixes || []).map((f) => ({
+      targetFilePath: f.targetFilePath,
+      description: truncate(f.description, 200),
+      priority: f.priority,
+    })),
+    fixesApplied: (r.blueReport.fixesApplied || []).map((f) => ({
       filePath: f.filePath,
       description: truncate(f.description, 200),
     })),
@@ -92,8 +97,8 @@ function buildMissionPrompt(
       `The user explicitly selected these components for focused testing (highest priority first):`,
     );
     for (const c of userPriorityList) {
-      const status = c.covered ? "COVERED" : c.issueCount > 0 ? `ISSUES(${c.issueCount}), fixes(${c.fixCount})` : "UNTESTED";
-      sections.push(`- **${c.id}** — ${status}`);
+      const display = c.status === "pass" ? "PASS" : c.status === "fail" ? `FAIL(${c.issueCount} issues, ${c.fixCount} fixes)` : c.status === "proceed" ? "PROCEED" : "UNTESTED";
+      sections.push(`- **${c.id}** — ${display}`);
     }
   }
 
@@ -115,15 +120,16 @@ function buildMissionPrompt(
     `Generate a Mission JSON targeting components based on the following strategy:`,
     ``,
     `### Depth-First Retesting Strategy`,
-    `1. **Re-validate fixed components** — If a user-priority component had issues in a previous round AND blue team applied fixes, re-target it to validate the fixes work.`,
-    `2. **Re-attack unfixed components** — If a user-priority component had issues that were NOT fixed (no fixesApplied for it), re-target it with a different angle of attack.`,
-    `3. **Only broaden when priority components are confirmed** — Only move on to new/lower-priority components when all user-priority components are \`covered: true\`.`,
-    `4. **Vary the attack angle** — When retesting a component, use a different persona and conversation approach than previous rounds. Review the previous round objectives and change your strategy.`,
+    `1. **Re-validate fixed components** — If a user-priority component has status "fail" and fixes were applied, re-target it to validate the fixes work.`,
+    `2. **Re-attack failed components** — If a component has status "fail" with no fixes applied, re-target it with a different angle of attack.`,
+    `3. **Deepen "proceed" components** — Components with status "proceed" have been tested but need more depth. Test with different scenarios.`,
+    `4. **Only broaden when priority components pass** — Only move on to new/lower-priority components when all user-priority components are "pass".`,
+    `5. **Vary the attack angle** — When retesting a component, use a different persona and conversation approach than previous rounds.`,
     ``,
     `### Component Priority`,
     `Components have a numeric \`priority\` field (higher number = higher priority).`,
     `After applying the depth-first strategy above, prefer higher-priority components.`,
-    `Coverage status ranking: has-issues-with-fixes (revalidate) > has-issues-unfixed (retry) > untested > covered.`,
+    `Status ranking: fail (revalidate/retry) > proceed (deepen) > untested > pass (done).`,
     ``,
     `Set the round field to ${round}.`,
     `Generate a UUID for missionId.`,
@@ -215,7 +221,7 @@ export async function generateMission(
     debug(`mission: using fallback mission [${elapsed()}]`);
     // Fallback: generate a basic mission (sort by position in priorityComponents)
     const uncovered = inventory.components.filter(
-      (c) => !coverage.components[c.id]?.covered,
+      (c) => coverage.components[c.id]?.status !== "pass",
     );
     const rankMap = new Map(priorityComponents.map((id, i) => [id, i]));
     const sorted = uncovered.length > 0
@@ -240,6 +246,189 @@ export async function generateMission(
   }
 
   return mission;
+}
+
+// ─── Iteration Planning (Multi-Worker) ──────────────────────────────────────
+
+function buildIterationPlanPrompt(
+  inventory: Inventory,
+  coverage: CoverageState,
+  iteration: number,
+  totalIterations: number,
+  maxExchanges: number,
+  workerCount: number,
+  priorityComponents: string[] = [],
+): string {
+  // Reuse the base mission prompt content for context
+  const basePrompt = buildMissionPrompt(
+    inventory,
+    coverage,
+    iteration,
+    totalIterations,
+    maxExchanges,
+    priorityComponents,
+  );
+
+  // Replace the MODE and instructions sections
+  const sections: string[] = [
+    basePrompt.replace("MODE: GENERATE_MISSION", "MODE: PLAN_ITERATION"),
+    ``,
+    `## Multi-Worker Planning`,
+    ``,
+    `You must generate exactly ${workerCount} missions, one for each worker.`,
+    `Each mission should target DIFFERENT components or test the same components from DIFFERENT angles.`,
+    `Ensure diversity: vary personas, attack angles, and edge cases across missions.`,
+    ``,
+    `## Status Updates`,
+    ``,
+    `Review all previous iteration results. For components with status "proceed":`,
+    `- If the component has been tested thoroughly across multiple iterations with no issues, promote it to "pass".`,
+    `- If it still needs more depth, leave it as "proceed".`,
+    `For components with status "fail" that have had fixes applied and retested successfully, you may promote to "proceed" or "pass".`,
+    ``,
+    `Output your response as an IterationPlan JSON with:`,
+    `- \`missions\`: array of exactly ${workerCount} Mission objects`,
+    `- \`statusUpdates\`: array of status changes (componentId, newStatus, reason)`,
+    ``,
+    `Each mission must have a unique missionId (UUID), round set to ${iteration}, and estimatedTurns <= ${maxExchanges}.`,
+  ];
+
+  return sections.join("\n");
+}
+
+export async function planIteration(
+  inventory: Inventory,
+  coverage: CoverageState,
+  iteration: number,
+  totalIterations: number,
+  maxExchanges: number,
+  workerCount: number,
+  abortController: AbortController,
+  priorityComponents: string[] = [],
+): Promise<IterationPlan> {
+  const tenetPrompt = PROMPTS.tenet;
+  const claudePath = getClaudePath();
+  const prompt = buildIterationPlanPrompt(
+    inventory,
+    coverage,
+    iteration,
+    totalIterations,
+    maxExchanges,
+    workerCount,
+    priorityComponents,
+  );
+
+  const { CLAUDECODE: _, ...cleanEnv } = Deno.env.toObject();
+
+  debug(`plan-iteration: starting SDK call — ${workerCount} workers, prompt ${prompt.length} chars`);
+  const elapsed = startTimer();
+
+  const planQuery = query({
+    prompt,
+    options: {
+      model: "claude-opus-4-6",
+      pathToClaudeCodeExecutable: claudePath,
+      env: cleanEnv,
+      systemPrompt: tenetPrompt,
+      tools: [],
+      outputFormat: { type: "json_schema", schema: ITERATION_PLAN_SCHEMA },
+      persistSession: false,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      maxTurns: 5,
+      abortController,
+    },
+  });
+
+  let plan: IterationPlan | null = null;
+
+  try {
+    let msgCount = 0;
+    for await (const msg of planQuery) {
+      msgCount++;
+      if (abortController.signal.aborted) {
+        debug(`plan-iteration: aborted after ${msgCount} messages [${elapsed()}]`);
+        break;
+      }
+
+      const subtype = "subtype" in msg ? `:${msg.subtype}` : "";
+      debug(`plan-iteration: msg #${msgCount} type=${msg.type}${subtype} [${elapsed()}]`);
+
+      if (msg.type === "result") {
+        if (msg.subtype === "success" && msg.structured_output) {
+          plan = msg.structured_output as IterationPlan;
+          debug(`plan-iteration: got ${plan.missions.length} missions, ${plan.statusUpdates.length} status updates [${elapsed()}]`);
+        } else if (msg.subtype !== "success") {
+          printWarning(`Iteration planning ended with: ${msg.subtype}`);
+        }
+        break;
+      }
+    }
+    debug(`plan-iteration: stream ended — ${msgCount} messages [${elapsed()}]`);
+  } catch (err) {
+    if (!abortController.signal.aborted) {
+      printWarning(`Iteration planning error: ${err}`);
+      debug(`plan-iteration: EXCEPTION — ${err} [${elapsed()}]`);
+    }
+  } finally {
+    await planQuery.return(undefined as never);
+    debug(`plan-iteration: query closed [${elapsed()}]`);
+  }
+
+  // Fallback: generate N basic missions
+  if (!plan || plan.missions.length === 0) {
+    debug(`plan-iteration: using fallback — generating ${workerCount} missions`);
+    const rankMap = new Map(priorityComponents.map((id, i) => [id, i]));
+    const nonPassed = inventory.components
+      .filter((c) => coverage.components[c.id]?.status !== "pass")
+      .sort((a, b) => (rankMap.get(a.id) ?? 999) - (rankMap.get(b.id) ?? 999));
+
+    const missions: Mission[] = [];
+    for (let w = 0; w < workerCount; w++) {
+      // Distribute components across workers
+      const startIdx = Math.floor((w * nonPassed.length) / workerCount);
+      const endIdx = Math.floor(((w + 1) * nonPassed.length) / workerCount);
+      const targets = nonPassed.slice(startIdx, Math.max(endIdx, startIdx + 1)).map((c) => c.id);
+
+      if (targets.length === 0) {
+        // All components passed, target random ones
+        const allIds = inventory.components.map((c) => c.id);
+        targets.push(allIds[w % allIds.length]);
+      }
+
+      missions.push({
+        missionId: crypto.randomUUID(),
+        round: iteration,
+        objective: `Worker ${w + 1}: Test components ${targets.join(", ")}`,
+        targetComponents: targets,
+        persona: `A general user exploring the agent's capabilities (worker ${w + 1})`,
+        conversationStarters: [
+          "Hi, I need some help with a task.",
+          "Can you help me with something?",
+        ],
+        edgeCasesToProbe: ["Try ambiguous inputs", "Test error handling"],
+        successCriteria: targets.map((t) => `Component ${t} was exercised`),
+        estimatedTurns: Math.min(maxExchanges, 10),
+      });
+    }
+
+    plan = { missions, statusUpdates: [] };
+  }
+
+  // Ensure we have exactly workerCount missions
+  while (plan.missions.length < workerCount) {
+    // Duplicate the last mission with a new ID
+    const last = plan.missions[plan.missions.length - 1];
+    plan.missions.push({
+      ...last,
+      missionId: crypto.randomUUID(),
+    });
+  }
+  if (plan.missions.length > workerCount) {
+    plan.missions = plan.missions.slice(0, workerCount);
+  }
+
+  return plan;
 }
 
 // ─── Unit Test Mission Generation ───────────────────────────────────────────
