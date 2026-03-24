@@ -9,8 +9,8 @@ import { debug } from "../utils/logger.ts";
  */
 export async function createSandbox(targetPath: string): Promise<string> {
   const parent = dirname(resolve(targetPath));
-  const timestamp = Date.now();
-  const sandboxPath = join(parent, `.tenet-sandbox-${timestamp}`);
+  const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  const sandboxPath = join(parent, `.tenet-sandbox-${id}`);
   await Deno.mkdir(sandboxPath, { recursive: true });
   debug(`sandbox: created ${sandboxPath}`);
   return sandboxPath;

@@ -15,15 +15,16 @@ Commands:
   unit           Unit test — does each component handle diverse scenarios correctly?
 
 Options:
-  -r, --rounds <n>          Number of competition rounds (default: 3)
+  -r, --rounds <n>          Max iterations (default: 3)
   -e, --max-exchanges <n>   Max conversation turns per red team session (default: 3)
+  -w, --workers <n>         Number of parallel workers per iteration (default: 1)
   -t, --target <path>       Target project path (default: cwd)
   -v, --verbose             Show full session transcripts in output
-      --dry-run             Scan and generate first mission only, don't execute
+      --dry-run             Scan and generate missions only, don't execute
       --help                Print usage
 
 Examples:
-  tenet integration -t ./my-project -r 5
+  tenet integration -t ./my-project -r 5 -w 3
   tenet unit -t ./my-project -r 3 -e 5
   tenet -t ./my-project                    # defaults to integration
 `);
@@ -31,11 +32,12 @@ Examples:
 
 function parseConfig(): TenetConfig {
   const args = parseArgs(Deno.args, {
-    string: ["rounds", "r", "max-exchanges", "e", "target", "t"],
+    string: ["rounds", "r", "max-exchanges", "e", "workers", "w", "target", "t"],
     boolean: ["verbose", "v", "dry-run", "help"],
     alias: {
       r: "rounds",
       e: "max-exchanges",
+      w: "workers",
       t: "target",
       v: "verbose",
     },
@@ -65,6 +67,7 @@ function parseConfig(): TenetConfig {
     String(args["max-exchanges"] || "3"),
     10,
   );
+  const workers = parseInt(String(args.workers || "1"), 10);
   const targetPath = String(args.target || Deno.cwd());
   const verbose = Boolean(args.verbose);
   const dryRun = Boolean(args["dry-run"]);
@@ -77,8 +80,12 @@ function parseConfig(): TenetConfig {
     console.error("Error: --max-exchanges must be a positive integer");
     Deno.exit(1);
   }
+  if (isNaN(workers) || workers < 1) {
+    console.error("Error: --workers must be a positive integer");
+    Deno.exit(1);
+  }
 
-  return { testMode, rounds, maxExchanges, targetPath, verbose, dryRun };
+  return { testMode, rounds, maxExchanges, targetPath, verbose, dryRun, workers };
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────

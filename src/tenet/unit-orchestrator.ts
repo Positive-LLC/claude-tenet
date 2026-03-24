@@ -1,4 +1,4 @@
-import type { TenetConfig, UnitTestPlan } from "../types.ts";
+import type { TenetConfig, UnitTestPlan, Inventory, Mission, BlueTeamReport, RedTeamResult, CoverageState } from "../types.ts";
 import { DEFAULT_TYPE_PRIORITY } from "../types.ts";
 import { scanProject } from "./scanner.ts";
 import { generateUnitMission } from "./mission.ts";
@@ -16,12 +16,33 @@ import {
   printRoundComplete,
   printFinalSummary,
   printDryRunMission,
+  printUnitBatchStart,
+  printUnitBatchComplete,
   printError,
+  printWarning,
   debug,
   startTimer,
   setVerbose,
 } from "../utils/logger.ts";
 import { multiSelect } from "../utils/multiselect.ts";
+
+// ─── Types (local to unit orchestrator) ──────────────────────────────────────
+
+interface UnitTaskContext {
+  plan: UnitTestPlan;
+  sandboxPath: string;
+  customSystemPrompt: string | undefined;
+}
+
+interface UnitTaskResult {
+  plan: UnitTestPlan;
+  sandboxPath: string;
+  mission?: Mission;
+  redResult?: RedTeamResult;
+  blueReport?: BlueTeamReport;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
  * Load the system prompt content for a component (agent .md or CLAUDE.md).
@@ -59,7 +80,100 @@ function loadSystemPrompt(
   return undefined;
 }
 
+/**
+ * Create a worker context: sandbox + system prompt.
+ */
+async function createWorkerContext(
+  plan: UnitTestPlan,
+  config: TenetConfig,
+  inventory: Inventory,
+): Promise<UnitTaskContext> {
+  const sandboxPath = await createSandbox(config.targetPath);
+  plan.sandboxPath = sandboxPath;
+  await populateSandbox(sandboxPath, config.targetPath, plan, inventory);
+
+  let customSystemPrompt: string | undefined;
+  if (plan.setupType === "focus") {
+    const ownerComp = inventory.components.find(
+      (c) => c.id === plan.systemPromptSource,
+    );
+    customSystemPrompt = loadSystemPrompt(ownerComp, config.targetPath);
+  }
+
+  return { plan, sandboxPath, customSystemPrompt };
+}
+
+/**
+ * Execute a single unit task (red + blue) inside a sandbox.
+ */
+async function executeUnitTask(
+  ctx: UnitTaskContext,
+  mission: Mission,
+  config: TenetConfig,
+  inventory: Inventory,
+  abortController: AbortController,
+): Promise<UnitTaskResult> {
+  const result: UnitTaskResult = {
+    plan: ctx.plan,
+    sandboxPath: ctx.sandboxPath,
+    mission,
+  };
+
+  const label = `unit-worker[${ctx.plan.targetComponent}]`;
+
+  // Red team
+  debug(`${label}: starting red team`);
+  try {
+    result.redResult = await runRedTeam(
+      mission,
+      ctx.sandboxPath,
+      config.maxExchanges,
+      abortController,
+      inventory.plugins,
+      ctx.customSystemPrompt,
+    );
+    debug(`${label}: red team done — ${result.redResult.conversationTurns} turns`);
+  } catch (err) {
+    printError(`${label} red team failed`, err);
+    return result;
+  }
+
+  if (abortController.signal.aborted) return result;
+
+  // Blue team (full tool access in sandbox — isolated, no conflict risk)
+  debug(`${label}: starting blue team`);
+  try {
+    result.blueReport = await runBlueTeam(
+      result.redResult,
+      mission,
+      inventory,
+      ctx.sandboxPath,
+      abortController,
+      inventory.plugins,
+    );
+    debug(`${label}: blue team done — ${result.blueReport.issuesFound.length} issues`);
+  } catch (err) {
+    printError(`${label} blue team failed`, err);
+  }
+
+  return result;
+}
+
+// ─── Public Entry Point ──────────────────────────────────────────────────────
+
 export async function runUnitTenet(
+  config: TenetConfig,
+  abortController: AbortController,
+): Promise<void> {
+  if (config.workers <= 1) {
+    return runUnitTenetSequential(config, abortController);
+  }
+  return runUnitTenetMultiWorker(config, abortController);
+}
+
+// ─── Multi-Worker Mode ───────────────────────────────────────────────────────
+
+async function runUnitTenetMultiWorker(
   config: TenetConfig,
   abortController: AbortController,
 ): Promise<void> {
@@ -74,7 +188,254 @@ export async function runUnitTenet(
   if (inventory.components.length === 0) {
     console.log(
       "  No components found. Is this a Claude agent project?\n" +
-        "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+    );
+    return;
+  }
+
+  // Filter out MCP servers for unit testing
+  const testableComponents = inventory.components.filter(
+    (c) => c.type !== "mcp_server",
+  );
+
+  if (testableComponents.length === 0) {
+    console.log("  No testable components found (MCP servers are skipped in unit test mode).\n");
+    return;
+  }
+
+  // Step 2: User priority selection
+  const userSelected = await multiSelect({
+    title: "Select components to unit test (or Enter for all):",
+    hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
+    items: testableComponents.map((c) => ({
+      label: `[${c.type}] ${c.id.replace(/^[^:]+:/, "")}`,
+      value: c.id,
+    })),
+  });
+
+  const userSelectedSet = new Set(userSelected);
+  const remaining = testableComponents
+    .filter((c) => !userSelectedSet.has(c.id))
+    .sort((a, b) => DEFAULT_TYPE_PRIORITY[b.type] - DEFAULT_TYPE_PRIORITY[a.type])
+    .map((c) => c.id);
+  const priorityComponents = [...userSelected, ...remaining];
+
+  // Step 3: LLM ownership analysis
+  console.log("  Analyzing component ownership...\n");
+  const ownershipTimer = startTimer();
+  const ownershipResult = await analyzeOwnership(
+    inventory,
+    config.targetPath,
+    abortController,
+  );
+  debug(`unit-orchestrator: ownership analysis done [${ownershipTimer()}] — ${ownershipResult.assignments.length} assignments`);
+
+  if (abortController.signal.aborted) return;
+
+  // Build test plans
+  const allPlans = buildUnitTestPlans(inventory, ownershipResult);
+  const planMap = new Map(allPlans.map((p) => [p.targetComponent, p]));
+  const orderedPlans: UnitTestPlan[] = [];
+  for (const compId of priorityComponents) {
+    const plan = planMap.get(compId);
+    if (plan) orderedPlans.push(plan);
+  }
+
+  console.log(`  ${orderedPlans.length} unit test plans ready (${config.workers} workers).\n`);
+
+  // Initialize coverage
+  const coverage = initCoverage(inventory);
+
+  // Dry run: generate missions for first batch
+  if (config.dryRun) {
+    const batchSize = Math.min(config.workers, orderedPlans.length);
+    const batch = orderedPlans.slice(0, batchSize);
+    console.log(`  Generating ${batchSize} unit test mission(s) (dry run)...\n`);
+    const missions = await Promise.all(
+      batch.map((plan) =>
+        generateUnitMission(
+          plan,
+          inventory,
+          coverage,
+          1,
+          config.rounds,
+          config.maxExchanges,
+          abortController,
+          config.targetPath,
+        )
+      ),
+    );
+    for (let i = 0; i < missions.length; i++) {
+      console.log(`  ── Worker ${i + 1}: ${batch[i].targetComponent} ──`);
+      printDryRunMission(missions[i]);
+    }
+
+    console.log("\n  Ownership assignments:");
+    for (const a of ownershipResult.assignments) {
+      console.log(`    ${a.componentId} → owner: ${a.ownerComponentId} (${a.reasoning.slice(0, 60)})`);
+    }
+    console.log();
+    return;
+  }
+
+  // Build queue from ordered plans
+  const queue = [...orderedPlans];
+  let iteration = 0;
+
+  while (queue.length > 0 && iteration < config.rounds) {
+    if (abortController.signal.aborted) break;
+
+    iteration++;
+    const batchSize = Math.min(config.workers, queue.length);
+    const batch = queue.splice(0, batchSize);
+
+    printUnitBatchStart(iteration, batch.map((p) => p.targetComponent), queue.length);
+
+    // A. Create N sandboxes in parallel
+    debug(`unit-orchestrator: creating ${batchSize} sandboxes`);
+    const contextTimer = startTimer();
+    let contexts: UnitTaskContext[];
+    try {
+      contexts = await Promise.all(
+        batch.map((plan) => createWorkerContext(plan, config, inventory)),
+      );
+      debug(`unit-orchestrator: sandboxes created [${contextTimer()}]`);
+    } catch (err) {
+      printError("Failed to create sandboxes", err);
+      // Cleanup any that were created
+      for (const plan of batch) {
+        if (plan.sandboxPath) {
+          await cleanupSandbox(plan.sandboxPath);
+        }
+      }
+      continue;
+    }
+
+    // B. Generate N missions in parallel
+    debug(`unit-orchestrator: generating ${batchSize} missions`);
+    const missionTimer = startTimer();
+    const missions = await Promise.all(
+      batch.map((plan) =>
+        generateUnitMission(
+          plan,
+          inventory,
+          coverage,
+          iteration,
+          config.rounds,
+          config.maxExchanges,
+          abortController,
+          config.targetPath,
+        )
+      ),
+    );
+    debug(`unit-orchestrator: missions generated [${missionTimer()}]`);
+
+    if (abortController.signal.aborted) {
+      for (const ctx of contexts) {
+        await cleanupSandbox(ctx.sandboxPath);
+      }
+      break;
+    }
+
+    // C. Execute N workers in parallel (red + blue per sandbox)
+    console.log(`  Dispatching ${batchSize} workers...\n`);
+    const execTimer = startTimer();
+    const results = await Promise.all(
+      contexts.map((ctx, i) =>
+        executeUnitTask(ctx, missions[i], config, inventory, abortController).catch(
+          (err): UnitTaskResult => {
+            printError(`Worker ${ctx.plan.targetComponent} failed`, err);
+            return { plan: ctx.plan, sandboxPath: ctx.sandboxPath, mission: missions[i] };
+          },
+        )
+      ),
+    );
+    debug(`unit-orchestrator: all workers done [${execTimer()}]`);
+
+    if (abortController.signal.aborted) {
+      for (const ctx of contexts) {
+        await cleanupSandbox(ctx.sandboxPath);
+      }
+      break;
+    }
+
+    // D. Sequential fix sync with conflict detection
+    const syncedFiles = new Set<string>();
+    for (const result of results) {
+      if (!result.blueReport || result.blueReport.fixesApplied.length === 0) continue;
+
+      for (const fix of result.blueReport.fixesApplied) {
+        if (syncedFiles.has(fix.filePath)) {
+          printWarning(`File conflict: ${fix.filePath} modified by multiple workers — last-write-wins from ${result.plan.targetComponent}`);
+        }
+        syncedFiles.add(fix.filePath);
+      }
+
+      console.log(`  Syncing ${result.blueReport.fixesApplied.length} fix(es) from ${result.plan.targetComponent}...\n`);
+      await syncFixesBack(result.sandboxPath, config.targetPath, result.blueReport.fixesApplied);
+    }
+
+    // E. Update coverage from all results
+    for (const result of results) {
+      if (result.blueReport && result.redResult && result.mission) {
+        updateCoverage(coverage, result.blueReport, result.redResult, iteration, result.mission.objective);
+      }
+    }
+
+    // F. Cleanup N sandboxes in parallel
+    await Promise.all(
+      contexts.map((ctx) => cleanupSandbox(ctx.sandboxPath)),
+    );
+
+    // G. Re-queue failed components (no blue report = failed)
+    for (const result of results) {
+      if (!result.blueReport) {
+        // Re-queue if it failed entirely
+        const plan = planMap.get(result.plan.targetComponent);
+        if (plan) {
+          queue.push(plan);
+          debug(`unit-orchestrator: re-queued ${result.plan.targetComponent}`);
+        }
+      }
+    }
+
+    // H. Print batch summary + check early exit
+    printUnitBatchComplete(iteration, results, coverage);
+
+    if (userSelectedSet.size > 0) {
+      const stats = getCoverageStats(coverage, userSelectedSet);
+      if (stats.covered === stats.total && stats.total > 0) {
+        console.log("  Selected components — all pass! Stopping early.\n");
+        break;
+      }
+    }
+  }
+
+  // Final summary
+  if (coverage.rounds.length > 0) {
+    printFinalSummary(coverage);
+  }
+  debug(`unit-orchestrator: total runtime [${totalElapsed()}]`);
+}
+
+// ─── Sequential Mode (Backward Compatible) ──────────────────────────────────
+
+async function runUnitTenetSequential(
+  config: TenetConfig,
+  abortController: AbortController,
+): Promise<void> {
+  setVerbose(config.verbose);
+  const totalElapsed = startTimer();
+
+  // Step 1: Scan
+  console.log("  Scanning target project...\n");
+  const inventory = await scanProject(config.targetPath);
+  printScanResult(inventory);
+
+  if (inventory.components.length === 0) {
+    console.log(
+      "  No components found. Is this a Claude agent project?\n" +
+      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
     );
     return;
   }
