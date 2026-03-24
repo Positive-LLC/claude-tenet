@@ -2,7 +2,7 @@ import { parseArgs } from "https://deno.land/std@0.224.0/cli/parse_args.ts";
 import type { TenetConfig, TestMode } from "./types.ts";
 import { runTenet } from "./tenet/orchestrator.ts";
 import { runUnitTenet } from "./tenet/unit-orchestrator.ts";
-import { printBanner } from "./utils/logger.ts";
+import { createInkUI } from "./ui/ink-renderer.ts";
 
 function printUsage(): void {
   console.log(`
@@ -90,30 +90,32 @@ function parseConfig(): TenetConfig {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+const config = parseConfig();
 const abortController = new AbortController();
+const { ui, unmount } = createInkUI();
 
 Deno.addSignalListener("SIGINT", () => {
-  console.log("\n  Received SIGINT, shutting down gracefully...");
   abortController.abort();
+  unmount();
+  console.error("\n  Aborted by user.");
+  Deno.exit(130);
 });
-
-printBanner();
-const config = parseConfig();
 
 try {
   if (config.testMode === "unit") {
-    await runUnitTenet(config, abortController);
+    await runUnitTenet(config, abortController, ui);
   } else {
-    await runTenet(config, abortController);
+    await runTenet(config, abortController, ui);
   }
 } catch (error) {
-  if (abortController.signal.aborted) {
-    console.log("  Aborted by user.");
-  } else {
+  unmount();
+  if (!abortController.signal.aborted) {
     console.error(
       "  Fatal error:",
       error instanceof Error ? error.message : error,
     );
     Deno.exit(1);
   }
+} finally {
+  unmount();
 }

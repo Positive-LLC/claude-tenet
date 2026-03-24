@@ -1,5 +1,6 @@
 import type { TenetConfig, UnitTestPlan, Inventory, Mission, BlueTeamReport, RedTeamResult, CoverageState } from "../types.ts";
 import { DEFAULT_TYPE_PRIORITY } from "../types.ts";
+import type { TenetUI } from "../ui/events.ts";
 import { scanProject } from "./scanner.ts";
 import { generateUnitMission } from "./mission.ts";
 import { analyzeOwnership, buildUnitTestPlans } from "./ownership.ts";
@@ -9,22 +10,10 @@ import { runRedTeam } from "../red/red-team.ts";
 import { runBlueTeam } from "../blue/blue-team.ts";
 import { resolve, join } from "https://deno.land/std@0.224.0/path/mod.ts";
 import {
-  printScanResult,
-  printRoundStart,
-  printRedTeamResult,
-  printBlueTeamResult,
-  printRoundComplete,
-  printFinalSummary,
-  printDryRunMission,
-  printUnitBatchStart,
-  printUnitBatchComplete,
-  printError,
-  printWarning,
   debug,
   startTimer,
   setVerbose,
 } from "../utils/logger.ts";
-import { multiSelect } from "../utils/multiselect.ts";
 
 // ─── Types (local to unit orchestrator) ──────────────────────────────────────
 
@@ -112,6 +101,7 @@ async function executeUnitTask(
   config: TenetConfig,
   inventory: Inventory,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<UnitTaskResult> {
   const result: UnitTaskResult = {
     plan: ctx.plan,
@@ -134,7 +124,7 @@ async function executeUnitTask(
     );
     debug(`${label}: red team done — ${result.redResult.conversationTurns} turns`);
   } catch (err) {
-    printError(`${label} red team failed`, err);
+    ui.emit({ type: "error", context: `${label} red team failed`, error: err });
     return result;
   }
 
@@ -153,7 +143,7 @@ async function executeUnitTask(
     );
     debug(`${label}: blue team done — ${result.blueReport.issuesFound.length} issues`);
   } catch (err) {
-    printError(`${label} blue team failed`, err);
+    ui.emit({ type: "error", context: `${label} blue team failed`, error: err });
   }
 
   return result;
@@ -164,11 +154,12 @@ async function executeUnitTask(
 export async function runUnitTenet(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   if (config.workers <= 1) {
-    return runUnitTenetSequential(config, abortController);
+    return runUnitTenetSequential(config, abortController, ui);
   }
-  return runUnitTenetMultiWorker(config, abortController);
+  return runUnitTenetMultiWorker(config, abortController, ui);
 }
 
 // ─── Multi-Worker Mode ───────────────────────────────────────────────────────
@@ -176,20 +167,23 @@ export async function runUnitTenet(
 async function runUnitTenetMultiWorker(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   setVerbose(config.verbose);
   const totalElapsed = startTimer();
 
   // Step 1: Scan
-  console.log("  Scanning target project...\n");
+  ui.emit({ type: "status", message: "  Scanning target project...\n", spinner: true });
   const inventory = await scanProject(config.targetPath);
-  printScanResult(inventory);
+  ui.emit({ type: "scan-result", inventory });
 
   if (inventory.components.length === 0) {
-    console.log(
-      "  No components found. Is this a Claude agent project?\n" +
-      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
-    );
+    ui.emit({
+      type: "status",
+      message:
+        "  No components found. Is this a Claude agent project?\n" +
+        "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+    });
     return;
   }
 
@@ -199,12 +193,12 @@ async function runUnitTenetMultiWorker(
   );
 
   if (testableComponents.length === 0) {
-    console.log("  No testable components found (MCP servers are skipped in unit test mode).\n");
+    ui.emit({ type: "status", message: "  No testable components found (MCP servers are skipped in unit test mode).\n" });
     return;
   }
 
   // Step 2: User priority selection
-  const userSelected = await multiSelect({
+  const userSelected = await ui.multiSelect({
     title: "Select components to unit test (or Enter for all):",
     hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
     items: testableComponents.map((c) => ({
@@ -221,7 +215,7 @@ async function runUnitTenetMultiWorker(
   const priorityComponents = [...userSelected, ...remaining];
 
   // Step 3: LLM ownership analysis
-  console.log("  Analyzing component ownership...\n");
+  ui.emit({ type: "status", message: "  Analyzing component ownership...\n", spinner: true });
   const ownershipTimer = startTimer();
   const ownershipResult = await analyzeOwnership(
     inventory,
@@ -241,7 +235,7 @@ async function runUnitTenetMultiWorker(
     if (plan) orderedPlans.push(plan);
   }
 
-  console.log(`  ${orderedPlans.length} unit test plans ready (${config.workers} workers).\n`);
+  ui.emit({ type: "status", message: `  ${orderedPlans.length} unit test plans ready (${config.workers} workers).\n` });
 
   // Initialize coverage
   const coverage = initCoverage(inventory);
@@ -250,7 +244,7 @@ async function runUnitTenetMultiWorker(
   if (config.dryRun) {
     const batchSize = Math.min(config.workers, orderedPlans.length);
     const batch = orderedPlans.slice(0, batchSize);
-    console.log(`  Generating ${batchSize} unit test mission(s) (dry run)...\n`);
+    ui.emit({ type: "status", message: `  Generating ${batchSize} unit test mission(s) (dry run)...\n`, spinner: true });
     const missions = await Promise.all(
       batch.map((plan) =>
         generateUnitMission(
@@ -266,15 +260,11 @@ async function runUnitTenetMultiWorker(
       ),
     );
     for (let i = 0; i < missions.length; i++) {
-      console.log(`  ── Worker ${i + 1}: ${batch[i].targetComponent} ──`);
-      printDryRunMission(missions[i]);
+      ui.emit({ type: "status", message: `  ── Worker ${i + 1}: ${batch[i].targetComponent} ──` });
+      ui.emit({ type: "dry-run-mission", mission: missions[i] });
     }
 
-    console.log("\n  Ownership assignments:");
-    for (const a of ownershipResult.assignments) {
-      console.log(`    ${a.componentId} → owner: ${a.ownerComponentId} (${a.reasoning.slice(0, 60)})`);
-    }
-    console.log();
+    ui.emit({ type: "ownership-assignments", assignments: ownershipResult.assignments });
     return;
   }
 
@@ -289,7 +279,7 @@ async function runUnitTenetMultiWorker(
     const batchSize = Math.min(config.workers, queue.length);
     const batch = queue.splice(0, batchSize);
 
-    printUnitBatchStart(iteration, batch.map((p) => p.targetComponent), queue.length);
+    ui.emit({ type: "unit-batch-start", iteration, componentIds: batch.map((p) => p.targetComponent), totalRemaining: queue.length });
 
     // A. Create N sandboxes in parallel
     debug(`unit-orchestrator: creating ${batchSize} sandboxes`);
@@ -301,7 +291,7 @@ async function runUnitTenetMultiWorker(
       );
       debug(`unit-orchestrator: sandboxes created [${contextTimer()}]`);
     } catch (err) {
-      printError("Failed to create sandboxes", err);
+      ui.emit({ type: "error", context: "Failed to create sandboxes", error: err });
       // Cleanup any that were created
       for (const plan of batch) {
         if (plan.sandboxPath) {
@@ -338,13 +328,13 @@ async function runUnitTenetMultiWorker(
     }
 
     // C. Execute N workers in parallel (red + blue per sandbox)
-    console.log(`  Dispatching ${batchSize} workers...\n`);
+    ui.emit({ type: "status", message: `  Dispatching ${batchSize} workers...\n`, spinner: true });
     const execTimer = startTimer();
     const results = await Promise.all(
       contexts.map((ctx, i) =>
-        executeUnitTask(ctx, missions[i], config, inventory, abortController).catch(
+        executeUnitTask(ctx, missions[i], config, inventory, abortController, ui).catch(
           (err): UnitTaskResult => {
-            printError(`Worker ${ctx.plan.targetComponent} failed`, err);
+            ui.emit({ type: "error", context: `Worker ${ctx.plan.targetComponent} failed`, error: err });
             return { plan: ctx.plan, sandboxPath: ctx.sandboxPath, mission: missions[i] };
           },
         )
@@ -366,12 +356,12 @@ async function runUnitTenetMultiWorker(
 
       for (const fix of result.blueReport.fixesApplied) {
         if (syncedFiles.has(fix.filePath)) {
-          printWarning(`File conflict: ${fix.filePath} modified by multiple workers — last-write-wins from ${result.plan.targetComponent}`);
+          ui.emit({ type: "warning", message: `File conflict: ${fix.filePath} modified by multiple workers — last-write-wins from ${result.plan.targetComponent}` });
         }
         syncedFiles.add(fix.filePath);
       }
 
-      console.log(`  Syncing ${result.blueReport.fixesApplied.length} fix(es) from ${result.plan.targetComponent}...\n`);
+      ui.emit({ type: "status", message: `  Syncing ${result.blueReport.fixesApplied.length} fix(es) from ${result.plan.targetComponent}...\n` });
       await syncFixesBack(result.sandboxPath, config.targetPath, result.blueReport.fixesApplied);
     }
 
@@ -400,12 +390,12 @@ async function runUnitTenetMultiWorker(
     }
 
     // H. Print batch summary + check early exit
-    printUnitBatchComplete(iteration, results, coverage);
+    ui.emit({ type: "unit-batch-complete", iteration, results, coverage });
 
     if (userSelectedSet.size > 0) {
       const stats = getCoverageStats(coverage, userSelectedSet);
       if (stats.covered === stats.total && stats.total > 0) {
-        console.log("  Selected components — all pass! Stopping early.\n");
+        ui.emit({ type: "status", message: "  Selected components — all pass! Stopping early.\n" });
         break;
       }
     }
@@ -413,7 +403,7 @@ async function runUnitTenetMultiWorker(
 
   // Final summary
   if (coverage.rounds.length > 0) {
-    printFinalSummary(coverage);
+    ui.emit({ type: "final-summary", coverage });
   }
   debug(`unit-orchestrator: total runtime [${totalElapsed()}]`);
 }
@@ -423,20 +413,23 @@ async function runUnitTenetMultiWorker(
 async function runUnitTenetSequential(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   setVerbose(config.verbose);
   const totalElapsed = startTimer();
 
   // Step 1: Scan
-  console.log("  Scanning target project...\n");
+  ui.emit({ type: "status", message: "  Scanning target project...\n", spinner: true });
   const inventory = await scanProject(config.targetPath);
-  printScanResult(inventory);
+  ui.emit({ type: "scan-result", inventory });
 
   if (inventory.components.length === 0) {
-    console.log(
-      "  No components found. Is this a Claude agent project?\n" +
-      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
-    );
+    ui.emit({
+      type: "status",
+      message:
+        "  No components found. Is this a Claude agent project?\n" +
+        "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+    });
     return;
   }
 
@@ -446,12 +439,12 @@ async function runUnitTenetSequential(
   );
 
   if (testableComponents.length === 0) {
-    console.log("  No testable components found (MCP servers are skipped in unit test mode).\n");
+    ui.emit({ type: "status", message: "  No testable components found (MCP servers are skipped in unit test mode).\n" });
     return;
   }
 
   // Step 2: User priority selection
-  const userSelected = await multiSelect({
+  const userSelected = await ui.multiSelect({
     title: "Select components to unit test (or Enter for all):",
     hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
     items: testableComponents.map((c) => ({
@@ -468,7 +461,7 @@ async function runUnitTenetSequential(
   const priorityComponents = [...userSelected, ...remaining];
 
   // Step 3: LLM ownership analysis
-  console.log("  Analyzing component ownership...\n");
+  ui.emit({ type: "status", message: "  Analyzing component ownership...\n", spinner: true });
   const ownershipTimer = startTimer();
   const ownershipResult = await analyzeOwnership(
     inventory,
@@ -490,7 +483,7 @@ async function runUnitTenetSequential(
     if (plan) orderedPlans.push(plan);
   }
 
-  console.log(`  ${orderedPlans.length} unit test plans ready.\n`);
+  ui.emit({ type: "status", message: `  ${orderedPlans.length} unit test plans ready.\n` });
 
   // Initialize coverage
   const coverage = initCoverage(inventory);
@@ -499,10 +492,10 @@ async function runUnitTenetSequential(
   if (config.dryRun) {
     const firstPlan = orderedPlans[0];
     if (!firstPlan) {
-      console.log("  No plans to show.\n");
+      ui.emit({ type: "status", message: "  No plans to show.\n" });
       return;
     }
-    console.log("  Generating unit test mission (dry run)...\n");
+    ui.emit({ type: "status", message: "  Generating unit test mission (dry run)...\n", spinner: true });
     const mission = await generateUnitMission(
       firstPlan,
       inventory,
@@ -513,13 +506,9 @@ async function runUnitTenetSequential(
       abortController,
       config.targetPath,
     );
-    printDryRunMission(mission);
+    ui.emit({ type: "dry-run-mission", mission });
 
-    console.log("\n  Ownership assignments:");
-    for (const a of ownershipResult.assignments) {
-      console.log(`    ${a.componentId} → owner: ${a.ownerComponentId} (${a.reasoning.slice(0, 60)})`);
-    }
-    console.log();
+    ui.emit({ type: "ownership-assignments", assignments: ownershipResult.assignments });
     return;
   }
 
@@ -527,7 +516,7 @@ async function runUnitTenetSequential(
   for (const plan of orderedPlans) {
     if (abortController.signal.aborted) break;
 
-    console.log(`\n  ═══ Unit Testing: ${plan.targetComponent} ═══\n`);
+    ui.emit({ type: "status", message: `\n  ═══ Unit Testing: ${plan.targetComponent} ═══\n` });
     debug(`unit-orchestrator: testing ${plan.targetComponent} — setup=${plan.setupType}, owner=${plan.systemPromptSource}`);
 
     // Create sandbox
@@ -537,7 +526,7 @@ async function runUnitTenetSequential(
       plan.sandboxPath = sandboxPath;
       await populateSandbox(sandboxPath, config.targetPath, plan, inventory);
     } catch (err) {
-      printError(`Failed to create sandbox for ${plan.targetComponent}`, err);
+      ui.emit({ type: "error", context: `Failed to create sandbox for ${plan.targetComponent}`, error: err });
       continue;
     }
 
@@ -563,7 +552,7 @@ async function runUnitTenetSequential(
         }
 
         // Generate unit mission
-        console.log(`  Round ${round}/${config.rounds} — generating mission...\n`);
+        ui.emit({ type: "status", message: `  Round ${round}/${config.rounds} — generating mission...\n`, spinner: true });
         const missionTimer = startTimer();
         const mission = await generateUnitMission(
           plan,
@@ -578,10 +567,10 @@ async function runUnitTenetSequential(
         debug(`unit-orchestrator: mission generated [${missionTimer()}]`);
 
         if (abortController.signal.aborted) break;
-        printRoundStart(round, config.rounds, mission);
+        ui.emit({ type: "round-start", round, totalRounds: config.rounds, mission });
 
         // Red team (against sandbox)
-        console.log("  Running red team (sandbox)...\n");
+        ui.emit({ type: "status", message: "  Running red team (sandbox)...\n", spinner: true });
         const redTimer = startTimer();
         let redResult;
         try {
@@ -594,16 +583,16 @@ async function runUnitTenetSequential(
             customSystemPrompt,
           );
           debug(`unit-orchestrator: red team done [${redTimer()}]`);
-          printRedTeamResult(redResult);
+          ui.emit({ type: "red-team-result", result: redResult });
         } catch (err) {
-          printError("Red team failed", err);
+          ui.emit({ type: "error", context: "Red team failed", error: err });
           continue;
         }
 
         if (abortController.signal.aborted) break;
 
         // Blue team (analyzes sandbox session, fixes in sandbox)
-        console.log("  Running blue team...\n");
+        ui.emit({ type: "status", message: "  Running blue team...\n", spinner: true });
         const blueTimer = startTimer();
         let blueReport;
         try {
@@ -616,9 +605,9 @@ async function runUnitTenetSequential(
             inventory.plugins,
           );
           debug(`unit-orchestrator: blue team done [${blueTimer()}]`);
-          printBlueTeamResult(blueReport);
+          ui.emit({ type: "blue-team-result", report: blueReport });
         } catch (err) {
-          printError("Blue team failed", err);
+          ui.emit({ type: "error", context: "Blue team failed", error: err });
           continue;
         }
 
@@ -626,22 +615,23 @@ async function runUnitTenetSequential(
 
         // Sync fixes back to original project
         if (blueReport.fixesApplied.length > 0) {
-          console.log(`  Syncing ${blueReport.fixesApplied.length} fix(es) back to project...\n`);
+          ui.emit({ type: "status", message: `  Syncing ${blueReport.fixesApplied.length} fix(es) back to project...\n` });
           await syncFixesBack(sandboxPath, config.targetPath, blueReport.fixesApplied);
         }
 
         // Update coverage
         updateCoverage(coverage, blueReport, redResult, round, mission.objective);
 
-        printRoundComplete(
+        ui.emit({
+          type: "round-complete",
           round,
-          config.rounds,
+          totalRounds: config.rounds,
           mission,
           redResult,
           blueReport,
           coverage,
           inventory,
-        );
+        });
       }
     } finally {
       // Cleanup sandbox
@@ -652,7 +642,7 @@ async function runUnitTenetSequential(
     if (userSelectedSet.size > 0) {
       const stats = getCoverageStats(coverage, userSelectedSet);
       if (stats.covered === stats.total && stats.total > 0) {
-        console.log("  Selected components — all pass! Stopping early.\n");
+        ui.emit({ type: "status", message: "  Selected components — all pass! Stopping early.\n" });
         break;
       }
     }
@@ -660,7 +650,7 @@ async function runUnitTenetSequential(
 
   // Final summary
   if (coverage.rounds.length > 0) {
-    printFinalSummary(coverage);
+    ui.emit({ type: "final-summary", coverage });
   }
   debug(`unit-orchestrator: total runtime [${totalElapsed()}]`);
 }

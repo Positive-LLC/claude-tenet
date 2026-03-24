@@ -1,5 +1,6 @@
 import type { Inventory, Task, TaskResult, TenetConfig } from "../types.ts";
 import { DEFAULT_TYPE_PRIORITY } from "../types.ts";
+import type { TenetUI } from "../ui/events.ts";
 import { scanProject } from "./scanner.ts";
 import { generateMission, planIteration } from "./mission.ts";
 import {
@@ -14,26 +15,10 @@ import { collectAndDedup, applyFixes } from "./fix-phase.ts";
 import { runRedTeam } from "../red/red-team.ts";
 import { runBlueTeam } from "../blue/blue-team.ts";
 import {
-  printScanResult,
-  printRoundStart,
-  printRedTeamResult,
-  printBlueTeamResult,
-  printRoundComplete,
-  printFinalSummary,
-  printFinalSummaryV2,
-  printDryRunMission,
-  printDryRunIterationPlan,
-  printIterationStart,
-  printWorkerResult,
-  printFixPhaseResult,
-  printIterationComplete,
-  printError,
-  printWarning,
   debug,
   startTimer,
   setVerbose,
 } from "../utils/logger.ts";
-import { multiSelect } from "../utils/multiselect.ts";
 
 // ─── Worker Execution ───────────────────────────────────────────────────────
 
@@ -42,6 +27,7 @@ async function executeTask(
   config: TenetConfig,
   inventory: Inventory,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<TaskResult> {
   const result: TaskResult = {
     taskId: task.taskId,
@@ -50,42 +36,48 @@ async function executeTask(
 
   const label = config.workers > 1 ? `worker-${task.workerId}` : "";
 
-  // Red team
-  if (label) debug(`${label}: starting red team`);
   try {
-    result.redResult = await runRedTeam(
-      task.mission,
-      config.targetPath,
-      config.maxExchanges,
-      abortController,
-      inventory.plugins,
-    );
-    if (label) debug(`${label}: red team done — ${result.redResult.conversationTurns} turns`);
-  } catch (err) {
-    printError(`${label || "Red team"} red team failed`, err);
+    // Red team
+    ui.emit({ type: "worker-phase", workerId: task.workerId, phase: "red" });
+    if (label) debug(`${label}: starting red team`);
+    try {
+      result.redResult = await runRedTeam(
+        task.mission,
+        config.targetPath,
+        config.maxExchanges,
+        abortController,
+        inventory.plugins,
+      );
+      if (label) debug(`${label}: red team done — ${result.redResult.conversationTurns} turns`);
+    } catch (err) {
+      ui.emit({ type: "error", context: `${label || "Red team"} red team failed`, error: err });
+      return result;
+    }
+
+    if (abortController.signal.aborted) return result;
+
+    // Blue team (analysis-only in multi-worker integration mode)
+    ui.emit({ type: "worker-phase", workerId: task.workerId, phase: "blue" });
+    if (label) debug(`${label}: starting blue team (analysis-only)`);
+    try {
+      result.blueReport = await runBlueTeam(
+        result.redResult,
+        task.mission,
+        inventory,
+        config.targetPath,
+        abortController,
+        inventory.plugins,
+        true, // analysisOnly
+      );
+      if (label) debug(`${label}: blue team done — ${result.blueReport.issuesFound.length} issues`);
+    } catch (err) {
+      ui.emit({ type: "error", context: `${label || "Blue team"} blue team failed`, error: err });
+    }
+
     return result;
+  } finally {
+    ui.emit({ type: "worker-phase", workerId: task.workerId, phase: "done" });
   }
-
-  if (abortController.signal.aborted) return result;
-
-  // Blue team (analysis-only in multi-worker integration mode)
-  if (label) debug(`${label}: starting blue team (analysis-only)`);
-  try {
-    result.blueReport = await runBlueTeam(
-      result.redResult,
-      task.mission,
-      inventory,
-      config.targetPath,
-      abortController,
-      inventory.plugins,
-      true, // analysisOnly
-    );
-    if (label) debug(`${label}: blue team done — ${result.blueReport.issuesFound.length} issues`);
-  } catch (err) {
-    printError(`${label || "Blue team"} blue team failed`, err);
-  }
-
-  return result;
 }
 
 // ─── Main Orchestrator ──────────────────────────────────────────────────────
@@ -93,15 +85,16 @@ async function executeTask(
 export async function runTenet(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   setVerbose(config.verbose);
 
   // Route to single-worker mode for backward compatibility
   if (config.workers <= 1) {
-    return runTenetSingleWorker(config, abortController);
+    return runTenetSingleWorker(config, abortController, ui);
   }
 
-  return runTenetMultiWorker(config, abortController);
+  return runTenetMultiWorker(config, abortController, ui);
 }
 
 // ─── Multi-Worker Mode ──────────────────────────────────────────────────────
@@ -109,27 +102,30 @@ export async function runTenet(
 async function runTenetMultiWorker(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   const totalElapsed = startTimer();
 
   // Step 1: Initial scan
-  console.log("  Scanning target project...\n");
+  ui.emit({ type: "status", message: "  Scanning target project...\n", spinner: true });
   debug(`orchestrator: scanning ${config.targetPath}`);
   const phaseTimer = startTimer();
   let inventory = await scanProject(config.targetPath);
   debug(`orchestrator: scan complete [${phaseTimer()}]`);
-  printScanResult(inventory);
+  ui.emit({ type: "scan-result", inventory });
 
   if (inventory.components.length === 0) {
-    console.log(
-      "  No components found. Is this a Claude agent project?\n" +
-      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
-    );
+    ui.emit({
+      type: "status",
+      message:
+        "  No components found. Is this a Claude agent project?\n" +
+        "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+    });
     return;
   }
 
   // Prompt user for priority components
-  const userSelected = await multiSelect({
+  const userSelected = await ui.multiSelect({
     title: "Any components you want to prioritize for testing?",
     hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
     items: inventory.components.map((c) => ({
@@ -150,7 +146,7 @@ async function runTenetMultiWorker(
 
   // Dry run
   if (config.dryRun) {
-    console.log(`  Planning iteration (dry run, ${config.workers} workers)...\n`);
+    ui.emit({ type: "status", message: `  Planning iteration (dry run, ${config.workers} workers)...\n`, spinner: true });
     const plan = await planIteration(
       inventory,
       coverage,
@@ -161,7 +157,7 @@ async function runTenetMultiWorker(
       abortController,
       priorityComponents,
     );
-    printDryRunIterationPlan(plan.missions);
+    ui.emit({ type: "dry-run-iteration-plan", missions: plan.missions });
     return;
   }
 
@@ -173,7 +169,7 @@ async function runTenetMultiWorker(
     const scopeIds = userSelectedSet.size > 0 ? userSelectedSet : undefined;
     if (isFullyPassed(coverage, scopeIds) && iteration > 1) {
       const scope = scopeIds ? "Selected components" : "All components";
-      console.log(`  ${scope} — all pass! Stopping early.\n`);
+      ui.emit({ type: "status", message: `  ${scope} — all pass! Stopping early.\n` });
       break;
     }
 
@@ -183,7 +179,7 @@ async function runTenetMultiWorker(
     }
 
     // Plan iteration: generate N missions + status updates
-    console.log(`  Planning iteration ${iteration} (${config.workers} workers)...\n`);
+    ui.emit({ type: "status", message: `  Planning iteration ${iteration} (${config.workers} workers)...\n`, spinner: true });
     const planTimer = startTimer();
     const plan = await planIteration(
       inventory,
@@ -206,12 +202,12 @@ async function runTenetMultiWorker(
 
       // Re-check termination after status updates
       if (isFullyPassed(coverage, scopeIds)) {
-        console.log(`  All components promoted to pass after planning. Stopping early.\n`);
+        ui.emit({ type: "status", message: "  All components promoted to pass after planning. Stopping early.\n" });
         break;
       }
     }
 
-    printIterationStart(iteration, config.rounds, plan.missions, config.workers);
+    ui.emit({ type: "iteration-start", iteration, totalIterations: config.rounds, missions: plan.missions, workerCount: config.workers });
 
     // Dispatch tasks to workers
     const tasks: Task[] = plan.missions.map((mission, i) => ({
@@ -220,11 +216,11 @@ async function runTenetMultiWorker(
       workerId: i + 1,
     }));
 
-    console.log(`  Dispatching ${tasks.length} workers...\n`);
+    ui.emit({ type: "status", message: `  Dispatching ${tasks.length} workers...\n`, spinner: true });
     const dispatchTimer = startTimer();
 
     const results = await Promise.all(
-      tasks.map((task) => executeTask(task, config, inventory, abortController)),
+      tasks.map((task) => executeTask(task, config, inventory, abortController, ui)),
     );
 
     debug(`orchestrator: all workers complete [${dispatchTimer()}]`);
@@ -233,9 +229,9 @@ async function runTenetMultiWorker(
 
     // Print worker results
     for (const result of results) {
-      printWorkerResult(result.workerId, result);
+      ui.emit({ type: "worker-result", workerId: result.workerId, result });
     }
-    console.log("");
+    ui.emit({ type: "status", message: "" });
 
     // Update coverage from all blue reports
     updateCoverageFromResults(coverage, results, iteration);
@@ -244,12 +240,12 @@ async function runTenetMultiWorker(
     const proposedFixes = collectAndDedup(results);
     let fixesApplied = 0;
     if (proposedFixes.length > 0 && !abortController.signal.aborted) {
-      console.log(`  Applying ${proposedFixes.length} fixes...\n`);
+      ui.emit({ type: "status", message: `  Applying ${proposedFixes.length} fixes...\n`, spinner: true });
       const fixTimer = startTimer();
       fixesApplied = await applyFixes(proposedFixes, config.targetPath, abortController);
       debug(`orchestrator: fix phase complete [${fixTimer()}]`);
     }
-    printFixPhaseResult(fixesApplied, proposedFixes.length);
+    ui.emit({ type: "fix-phase-result", appliedCount: fixesApplied, totalProposed: proposedFixes.length });
 
     // Record iteration summary
     coverage.iterations.push({
@@ -260,12 +256,12 @@ async function runTenetMultiWorker(
     });
 
     // Print iteration report
-    printIterationComplete(iteration, config.rounds, results, coverage, fixesApplied);
+    ui.emit({ type: "iteration-complete", iteration, totalIterations: config.rounds, results, coverage, fixesApplied });
   }
 
   // Final summary
   if (coverage.iterations.length > 0) {
-    printFinalSummaryV2(coverage);
+    ui.emit({ type: "final-summary-v2", coverage });
   }
   debug(`orchestrator: total runtime [${totalElapsed()}]`);
 }
@@ -275,27 +271,30 @@ async function runTenetMultiWorker(
 async function runTenetSingleWorker(
   config: TenetConfig,
   abortController: AbortController,
+  ui: TenetUI,
 ): Promise<void> {
   const totalElapsed = startTimer();
 
   // Step 1: Initial scan
-  console.log("  Scanning target project...\n");
+  ui.emit({ type: "status", message: "  Scanning target project...\n", spinner: true });
   debug(`orchestrator: scanning ${config.targetPath}`);
   const phaseTimer = startTimer();
   const inventory = await scanProject(config.targetPath);
   debug(`orchestrator: scan complete [${phaseTimer()}]`);
-  printScanResult(inventory);
+  ui.emit({ type: "scan-result", inventory });
 
   if (inventory.components.length === 0) {
-    console.log(
-      "  No components found. Is this a Claude agent project?\n" +
-      "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
-    );
+    ui.emit({
+      type: "status",
+      message:
+        "  No components found. Is this a Claude agent project?\n" +
+        "  Expected: CLAUDE.md, .claude/skills/, .claude/commands/, etc.\n",
+    });
     return;
   }
 
   // Prompt user for priority components
-  const userSelected = await multiSelect({
+  const userSelected = await ui.multiSelect({
     title: "Any components you want to prioritize for testing?",
     hint: "↑/↓ navigate · Space toggle · Enter confirm · Esc use default priority",
     items: inventory.components.map((c) => ({
@@ -316,7 +315,7 @@ async function runTenetSingleWorker(
 
   // Dry run
   if (config.dryRun) {
-    console.log("  Generating mission (dry run)...\n");
+    ui.emit({ type: "status", message: "  Generating mission (dry run)...\n", spinner: true });
     const mission = await generateMission(
       inventory,
       coverage,
@@ -326,7 +325,7 @@ async function runTenetSingleWorker(
       abortController,
       priorityComponents,
     );
-    printDryRunMission(mission);
+    ui.emit({ type: "dry-run-mission", mission });
     return;
   }
 
@@ -339,7 +338,7 @@ async function runTenetSingleWorker(
     const stats = getCoverageStats(coverage, scopeIds);
     if (stats.covered === stats.total && stats.total > 0 && round > 1) {
       const scope = scopeIds ? "Selected components" : "Full coverage";
-      console.log(`  ${scope} — all pass! Stopping early.\n`);
+      ui.emit({ type: "status", message: `  ${scope} — all pass! Stopping early.\n` });
       break;
     }
 
@@ -350,7 +349,7 @@ async function runTenetSingleWorker(
     }
 
     // Generate mission
-    console.log(`  Generating mission for round ${round}...\n`);
+    ui.emit({ type: "status", message: `  Generating mission for round ${round}...\n`, spinner: true });
     let missionTimer = startTimer();
     debug(`orchestrator: generating mission for round ${round}`);
     const mission = await generateMission(
@@ -365,10 +364,10 @@ async function runTenetSingleWorker(
     debug(`orchestrator: mission generated [${missionTimer()}]`);
 
     if (abortController.signal.aborted) break;
-    printRoundStart(round, config.rounds, mission);
+    ui.emit({ type: "round-start", round, totalRounds: config.rounds, mission });
 
     // Red team
-    console.log("  Running red team...\n");
+    ui.emit({ type: "status", message: "  Running red team...\n", spinner: true });
     missionTimer = startTimer();
     debug(`orchestrator: starting red team — maxExchanges=${config.maxExchanges}`);
     let redResult;
@@ -381,17 +380,17 @@ async function runTenetSingleWorker(
         currentInventory.plugins,
       );
       debug(`orchestrator: red team done [${missionTimer()}] — ${redResult.conversationTurns} turns, $${redResult.costUsd.toFixed(2)}`);
-      printRedTeamResult(redResult);
+      ui.emit({ type: "red-team-result", result: redResult });
     } catch (err) {
       debug(`orchestrator: red team THREW [${missionTimer()}] — ${err}`);
-      printError("Red team failed", err);
+      ui.emit({ type: "error", context: "Red team failed", error: err });
       continue;
     }
 
     if (abortController.signal.aborted) break;
 
     // Blue team (with tool access in single-worker mode for backward compat)
-    console.log("  Running blue team...\n");
+    ui.emit({ type: "status", message: "  Running blue team...\n", spinner: true });
     missionTimer = startTimer();
     debug(`orchestrator: starting blue team — sessionFile=${redResult.sessionFilePath}`);
     let blueReport;
@@ -406,10 +405,10 @@ async function runTenetSingleWorker(
         false, // not analysis-only in single-worker mode
       );
       debug(`orchestrator: blue team done [${missionTimer()}] — ${blueReport.issuesFound.length} issues`);
-      printBlueTeamResult(blueReport);
+      ui.emit({ type: "blue-team-result", report: blueReport });
     } catch (err) {
       debug(`orchestrator: blue team THREW [${missionTimer()}] — ${err}`);
-      printError("Blue team failed", err);
+      ui.emit({ type: "error", context: "Blue team failed", error: err });
       continue;
     }
 
@@ -419,20 +418,21 @@ async function runTenetSingleWorker(
     updateCoverage(coverage, blueReport, redResult, round, mission.objective);
 
     // Print round report
-    printRoundComplete(
+    ui.emit({
+      type: "round-complete",
       round,
-      config.rounds,
+      totalRounds: config.rounds,
       mission,
       redResult,
       blueReport,
       coverage,
-      currentInventory,
-    );
+      inventory: currentInventory,
+    });
   }
 
   // Final summary
   if (coverage.rounds.length > 0) {
-    printFinalSummary(coverage);
+    ui.emit({ type: "final-summary", coverage });
   }
   debug(`orchestrator: total runtime [${totalElapsed()}]`);
 }

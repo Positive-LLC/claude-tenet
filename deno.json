@@ -1,9 +1,16 @@
 {
   "imports": {
-    "@anthropic-ai/claude-agent-sdk": "npm:@anthropic-ai/claude-agent-sdk@0.2.7"
+    "@anthropic-ai/claude-agent-sdk": "npm:@anthropic-ai/claude-agent-sdk@0.2.7",
+    "ink": "npm:ink@5",
+    "react": "npm:react@18",
+    "react/jsx-runtime": "npm:react@18/jsx-runtime",
+    "@types/react": "npm:@types/react@18",
+    "chalk": "npm:chalk@5"
   },
   "compilerOptions": {
-    "strict": true
+    "strict": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
   },
   "nodeModulesDir": "auto",
   "tasks": {
